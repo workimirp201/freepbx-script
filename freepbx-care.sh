@@ -32,10 +32,11 @@ ETC = Path('/etc/freepbx-care')
 STATE = Path('/var/lib/freepbx-care')
 LOG = Path('/var/log/freepbx-care')
 SELF = Path('/root/freepbx-care.sh')
-VERSION = '2026.10.23-asterisk-smtp-r3'
+VERSION = '2026.10.23-extensions-r4'
 DEFAULT = dict(email='monitor@famecomputers.com', sender='', auto_restart=True,
                failures=3, cooldown=1800, max_restarts_hour=2, boot_grace=300,
-               resume_grace=180, defer_active_calls=True, ami={})
+               resume_grace=180, defer_active_calls=True, ami={},
+               extension_monitor=dict(enabled=False, failures=3, groups=[]))
 
 
 def run(args, timeout=15, data=None, kill_group=True):
@@ -108,7 +109,7 @@ def readjson(path, default):
 def config():
     c = copy.deepcopy(DEFAULT)
     c.update(readjson(ETC / 'config.json', {}))
-    c.pop('properties', None)  # Extension monitoring is deferred for this release.
+    c.pop('properties', None)  # Old property data is not enabled without technician review.
     validate(c)
     return c
 
@@ -128,6 +129,33 @@ def validate(c):
     for key in ['auto_restart', 'defer_active_calls']:
         if type(c[key]) is not bool:
             raise ValueError(f'{key} must be boolean')
+    validate_extensions(c['extension_monitor'])
+
+
+def validate_extensions(settings):
+    if not isinstance(settings, dict) or type(settings.get('enabled')) is not bool:
+        raise ValueError('Invalid extension monitoring settings')
+    if type(settings.get('failures')) is not int or not 2 <= settings['failures'] <= 60:
+        raise ValueError('Extension failed checks must be 2..60')
+    groups = settings.get('groups')
+    if not isinstance(groups, list) or len(groups) > 100 or (settings['enabled'] and not groups):
+        raise ValueError('Enabled extension monitoring needs 1..100 groups')
+    names = set()
+    for group in groups:
+        if not isinstance(group, dict):
+            raise ValueError('Invalid extension group')
+        name = group.get('name')
+        if (not isinstance(name, str) or not name.strip() or len(name) > 100 or
+                any(ord(ch) < 32 or ord(ch) == 127 for ch in name) or name.casefold() in names):
+            raise ValueError('Use unique property names, 1..100 characters, without control characters')
+        names.add(name.casefold())
+        extensions = group.get('extensions')
+        if (not isinstance(extensions, list) or not 1 <= len(extensions) <= 500 or
+                any(not isinstance(ext, str) or not re.fullmatch(r'[0-9]{1,20}', ext) for ext in extensions) or
+                len(set(extensions)) != len(extensions)):
+            raise ValueError('Each group needs 1..500 unique numeric PJSIP extension/AOR IDs')
+        if group.get('mode') not in ['all', 'any']:
+            raise ValueError('Extension alert mode must be all or any')
 
 
 def log(message):
@@ -164,6 +192,197 @@ def transition(c, state, key, status, body):
 
 def cli(command):
     return run(['asterisk', '-rx', command])
+
+
+def pjsip_rows(text, label):
+    """Reject incomplete/unknown CLI output instead of interpreting it as offline."""
+    text = re.sub(r'\x1b\[[0-9;]*m', '', text)
+    rows = []
+    for line in text.splitlines():
+        match = re.match(r'^\s*' + label + r':\s+(.*)$', line)
+        if match and not match[1].startswith('<'):
+            rows.append(match[1].split())
+    footer = re.search(r'(?m)^\s*Objects found:\s*(\d+)\s*$', text)
+    empty = re.search(r'(?m)^\s*No objects found\.\s*$', text)
+    if (not footer or int(footer[1]) != len(rows)) and not (empty and not rows):
+        raise RuntimeError('Incomplete or unsupported PJSIP CLI output')
+    return rows
+
+
+def extension_report(c):
+    """One contact query and one AOR inventory query, shared across all groups."""
+    settings = c['extension_monitor']
+    if not settings['enabled']:
+        return dict(enabled=False, groups=[])
+    try:
+        outputs = []
+        for command in ['pjsip show contacts', 'pjsip list aors']:
+            rc, out, _ = cli(command)
+            if rc:
+                raise RuntimeError('PJSIP CLI query failed or timed out')
+            outputs.append(out)
+        aors = set()
+        for row in pjsip_rows(outputs[1], 'Aor'):
+            if len(row) != 2 or not row[1].isdigit():
+                raise RuntimeError('Unsupported PJSIP AOR row')
+            aors.add(row[0])
+        contacts = {}
+        for row in pjsip_rows(outputs[0], 'Contact'):
+            if len(row) != 4 or '/' not in row[0]:
+                raise RuntimeError('Unsupported PJSIP contact row')
+            aor = row[0].split('/', 1)[0]
+            contacts.setdefault(aor, []).append(row[2])
+        groups = []
+        for group in settings['groups']:
+            states = {}
+            for ext in group['extensions']:
+                values = contacts.get(ext, [])
+                if ext not in aors:
+                    states[ext] = 'unknown'  # Typo, deleted AOR or unsupported driver.
+                elif 'Avail' in values:
+                    states[ext] = 'available'
+                elif not values or all(value == 'Unavail' for value in values):
+                    states[ext] = 'unavailable'
+                else:
+                    states[ext] = 'unknown'  # Includes NonQual: present, not proven reachable.
+            values = list(states.values())
+            if group['mode'] == 'all':
+                status = ('healthy' if 'available' in values else
+                          'outage' if all(v == 'unavailable' for v in values) else 'unknown')
+            else:
+                status = ('outage' if 'unavailable' in values else
+                          'healthy' if all(v == 'available' for v in values) else 'unknown')
+            groups.append(dict(name=group['name'], mode=group['mode'], status=status, extensions=states))
+        return dict(enabled=True, groups=groups)
+    except (RuntimeError, ValueError, OSError) as e:
+        return dict(enabled=True, groups=[], error=str(e))
+
+
+def reset_extension_debounce(c):
+    if not c['extension_monitor']['enabled']:
+        return
+    path = STATE / 'extensions.json'
+    try:
+        st = readjson(path, {})
+        for value in st.get('groups', {}).values():
+            value['failures'] = 0
+        st['collection_failures'] = 0
+        save(path, st)
+    except (ValueError, OSError) as e:
+        log(f'Cannot reset extension debounce state: {e}; administrator review needed')
+
+
+def extensions_tick(c, pbx_healthy):
+    """Alert only. This code never invokes recovery or changes PBX health counters."""
+    if not c['extension_monitor']['enabled']:
+        return
+    if not pbx_healthy:
+        reset_extension_debounce(c)
+        log('Extension checks deferred: PBX health checks have not passed')
+        return
+    report = extension_report(c)
+    path = STATE / 'extensions.json'
+    st = readjson(path, {})
+    now = time.time()
+    groups = st.setdefault('groups', {})
+    if now - st.get('last_observed', now) > 300:
+        st['collection_failures'] = 0
+        for value in groups.values():
+            value['failures'] = 0
+    st.update(last_observed=now, last_report=report)
+    # Bound local sendmail wait time when many properties change at once.
+    # Unsent transitions stay pending for subsequent checks.
+    remaining = 5
+    def announce(target, key, status, body):
+        nonlocal remaining
+        previous = target.get('notified', {}).get(key)
+        if previous != status and not (previous is None and status == 'healthy'):
+            if remaining == 0:
+                log(f'Extension notification deferred to a later check: {key}')
+                return
+            remaining -= 1
+        transition(c, target, key, status, body)
+    unknown = report.get('error') or any(g['status'] == 'unknown' or
+        'unknown' in g['extensions'].values() for g in report['groups'])
+    if unknown:
+        st['collection_failures'] = st.get('collection_failures', 0) + 1
+        if st['collection_failures'] >= c['extension_monitor']['failures']:
+            announce(st, 'Extension collection', 'outage',
+                       'Cannot establish all extension states. Check PJSIP IDs, qualify settings and CLI output.\n' +
+                       json.dumps(report, indent=2))
+    else:
+        st['collection_failures'] = 0
+        announce(st, 'Extension collection', 'healthy', 'PJSIP extension state collection restored.')
+    if report.get('error'):
+        for value in groups.values():
+            value['failures'] = 0
+        log('Extension collection unavailable: ' + report['error'])
+    else:
+        active = set()
+        for definition, result in zip(c['extension_monitor']['groups'], report['groups']):
+            name = definition['name']
+            active.add(name)
+            signature = json.dumps(definition, sort_keys=True)
+            entry = groups.setdefault(name, {})
+            if entry.get('definition') != signature:
+                entry = groups[name] = dict(definition=signature)
+            entry['last_status'] = result['status']
+            if result['status'] == 'outage':
+                entry['failures'] = entry.get('failures', 0) + 1
+                if entry['failures'] >= c['extension_monitor']['failures']:
+                    announce(entry, name, 'outage', json.dumps(result, indent=2))
+            else:
+                entry['failures'] = 0
+                if result['status'] == 'healthy':
+                    meaning = ('At least one monitored extension is available again.' if definition['mode'] == 'all'
+                               else 'All monitored extensions are available again.')
+                    announce(entry, name, 'healthy', meaning + '\n' + json.dumps(result, indent=2))
+            log(f"Extensions {name}: {result['status']}")
+        st['groups'] = {name: value for name, value in groups.items() if name in active}
+    save(path, st)
+
+
+def configure_extensions():
+    c = config()
+    settings = copy.deepcopy(c['extension_monitor'])
+    print('PJSIP extension alerts only; extension outages NEVER restart Asterisk.')
+    print('Current groups:', json.dumps(settings['groups'], indent=2))
+    answer = ask('Enable extension monitoring? y/n', 'y' if settings['enabled'] else 'n').lower()
+    if answer not in ['y', 'n']:
+        raise ValueError('Answer y or n')
+    if answer == 'n':
+        settings['enabled'] = False
+    else:
+        settings['enabled'] = True
+        settings['failures'] = int(ask('Extension consecutive failed checks', str(settings['failures'])))
+        edit = ask('Replace property/extension groups? y/n', 'n' if settings['groups'] else 'y').lower()
+        if edit not in ['y', 'n']:
+            raise ValueError('Answer y or n')
+        if edit == 'y':
+            count = int(ask('How many properties/groups', '1'))
+            if not 1 <= count <= 100:
+                raise ValueError('Use 1..100 groups')
+            settings['groups'] = []
+            for i in range(count):
+                name = ask(f'Property/group {i + 1} name')
+                exts = re.split(r'[\s,]+', ask('PJSIP extension numbers (spaces or commas)').strip())
+                print('all = alert only when ALL selected extensions are unavailable (legacy behavior).')
+                print('any = alert when ANY selected extension is unavailable.')
+                mode = ask('Outage mode: all or any', 'all').lower()
+                settings['groups'].append(dict(name=name, extensions=exts, mode=mode))
+    validate_extensions(settings)
+    candidate = copy.deepcopy(c)
+    candidate['extension_monitor'] = settings
+    if settings['enabled']:
+        report = extension_report(candidate)
+        print('Extension preview (no email/restart):', json.dumps(report, indent=2))
+        if (report.get('error') or any('unknown' in g['extensions'].values() for g in report['groups'])):
+            raise RuntimeError('Settings NOT saved: resolve unknown PJSIP IDs/NonQual/CLI output, then retry')
+    c['extension_monitor'] = settings
+    save(ETC / 'config.json', c)
+    # Keep notification history for unchanged definitions; edits are reset on the next tick.
+    reset_extension_debounce(c)
+    print('Extension settings saved. Uses the existing Care timer; install with option 2 if not enabled.')
 
 
 PHP_CONFIG = r'''
@@ -309,16 +528,19 @@ def tick(c):
     boot = Path('/proc/sys/kernel/random/boot_id').read_text().strip()
     if st.get('boot') != boot:
         st.update(boot=boot, failures=0)
+        reset_extension_debounce(c)
     # Long scheduling gaps can follow LXC suspension, backup or host overload.
     gap = now - st.get('last_observed', now)
     if gap > 300:
         st.update(failures=0, settle_until=now + c['resume_grace'])
+        reset_extension_debounce(c)
     st['last_observed'] = now
     uptime = float(Path('/proc/uptime').read_text().split()[0])
     paused = (readjson(STATE / 'pause.json', {}).get('until', 0) > now or
               readjson(STATE / 'backup-pause.json', {}).get('until', 0) > now)
     if paused or uptime < c['boot_grace'] or st.get('settle_until', 0) > now or fwconsole_busy():
         st['failures'] = 0
+        reset_extension_debounce(c)
         save(statepath, st)
         log('Monitoring skipped: pause, boot/resume grace, or another fwconsole operation')
         return
@@ -367,6 +589,11 @@ def tick(c):
             elif not h['restartable']:
                 log('Configuration/authentication/protocol problem: automatic restart suppressed')
     save(statepath, st)
+    # Optional extension checks run after the core watchdog and cannot request recovery.
+    try:
+        extensions_tick(c, h['healthy'])
+    except (RuntimeError, ValueError, OSError) as e:
+        log(f'Extension monitoring failed: {e}; core PBX check completed')
 
 
 def ask(label, default='', secret=False):
@@ -680,11 +907,13 @@ def menu_action(choice):
         elif choice == '7': resume()
         elif choice == '8': checked(['systemctl', 'disable', '--now', 'freepbx-care.timer'])
         elif choice == '9': print('Diagnostics saved:', snapshot(health(config())))
+        elif choice == '10': configure_extensions()
+        elif choice == '11': print('Extension status (no email/restart):', json.dumps(extension_report(config()), indent=2))
 
 
 def menu():
     while True:
-        print(f'\nFreePBX Care {VERSION}\n1 Configure Asterisk monitor\n2 Install/update monitoring\n3 Configure SMTP relay\n4 Read-only health/status\n5 Send test email\n6 Pause monitoring\n7 Resume monitoring\n8 Disable monitoring\n9 Collect diagnostics (no restart)\n0 Exit')
+        print(f'\nFreePBX Care {VERSION}\n1 Configure Asterisk monitor\n2 Install/update monitoring\n3 Configure SMTP relay\n4 Read-only health/status\n5 Send test email\n6 Pause monitoring\n7 Resume monitoring\n8 Disable monitoring\n9 Collect diagnostics (no restart)\n10 Configure extension monitoring\n11 Read-only extension status\n0 Exit')
         choice = ask('Choose', '0')
         if choice == '0':
             return
@@ -701,6 +930,8 @@ def status():
     print('Saved state:', json.dumps(readjson(STATE / 'state.json', {}), indent=2))
     print('Maintenance:', json.dumps(readjson(STATE / 'pause.json', {})))
     print('Backup pause:', json.dumps(readjson(STATE / 'backup-pause.json', {})))
+    print('Extension settings:', json.dumps(config()['extension_monitor'], indent=2))
+    print('Saved extension state:', json.dumps(readjson(STATE / 'extensions.json', {}), indent=2))
     rc, out, err = run(['systemctl', 'status', 'freepbx-care.timer', '--no-pager'])
     print(out, err)
 
@@ -737,7 +968,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('command', nargs='?', default='menu', choices=[
         'menu', 'configure', 'install', 'preflight', 'smtp', 'status', 'diagnose', 'check', 'test-mail',
-        'pause', 'resume', 'backup-pause', 'backup-resume', 'disable'])
+        'pause', 'resume', 'backup-pause', 'backup-resume', 'disable', 'extensions', 'extensions-status'])
     parser.add_argument('--minutes', type=int, default=60)
     parser.add_argument('--smtp-config', help='root-owned mode-600 SMTP profile JSON')
     parser.add_argument('--version', action='version', version=VERSION)
@@ -757,6 +988,8 @@ def main():
                 raise RuntimeError('Configure monitoring first')
             tick(config())
         elif args.command == 'configure': configure()
+        elif args.command == 'extensions': configure_extensions()
+        elif args.command == 'extensions-status': print(json.dumps(extension_report(config()), indent=2))
         elif args.command == 'install': install()
         elif args.command == 'preflight': preflight()
         elif args.command == 'smtp': smtp_setup(smtp_profile(args.smtp_config) if args.smtp_config else None)

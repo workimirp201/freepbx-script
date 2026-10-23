@@ -1,5 +1,5 @@
 FREEPBX CARE - STANDALONE SERVER INSTRUCTIONS
-Prepared: 2026-10-23 | Script: 2026.10.23-asterisk-smtp-r3
+Prepared: 2026-10-23 | Script: 2026.10.23-extensions-r4
 
 Run every command directly ON THE PBX SERVER as root, over SSH or its console.
 This tool configures monitoring and outgoing email for an existing FreePBX
@@ -45,7 +45,7 @@ Download the main script. Copy the full command, including the && lines:
 Check the version:
   bash /root/freepbx-care.sh --version
 
-This guide matches 2026.10.23-asterisk-smtp-r3. Use matching instructions if a
+This guide matches 2026.10.23-extensions-r4. Use matching instructions if a
 later release changes the prompts. If a download or syntax check fails, stop
 and resolve the error before proceeding.
 
@@ -62,6 +62,8 @@ Run these tools with bash, even though they contain embedded Python.
 3. OLD SERVERS: CLEAN UP BEFORE INSTALLING THE REPLACEMENT
 =======================================================
 Skip this section for a new server with no legacy monitors.
+Before cleanup, record the old property names and selected extension numbers
+for manual entry in option 10. Do not assume the replacement imports them.
 
 A. NORMAL MIGRATION: KEEP EXISTING SMTP DURING CLEANUP
 
@@ -123,9 +125,12 @@ Menu options:
   7 Resume monitoring
   8 Disable monitoring
   9 Collect diagnostics (no restart)
+  10 Configure extension monitoring
+  11 Read-only extension status
   0 Exit
 
 Recommended order: 1 -> 3 -> 5 -> 4 -> 2 -> 0.
+When extension alerts are required, use 1 -> 3 -> 5 -> 10 -> 11 -> 4 -> 2 -> 0.
 Wait for actual test-email receipt before enabling monitoring with option 2.
 If intentionally keeping already verified SMTP on an old server, skip option 3
 but still do option 5 and confirm receipt. After an SMTP reset, option 3 is
@@ -191,6 +196,78 @@ between checks; inspect its journal for actual failures:
 Test normal incoming/outgoing calls and a voicemail email. Record hostname,
 script version, health, timer status, test-mail receipt, voicemail result and
 whether automatic recovery is enabled. Never record passwords.
+
+OPTION 10 - MANUALLY CONFIGURE EXTENSION MONITORING
+
+Extension monitoring is OPTIONAL and OFF until a technician configures it.
+Use PJSIP extension/AOR numbers from THIS PBX, not numbers from another property.
+No groups are automatically imported from the old installer. If migrating,
+record the old property names and extension lists before cleanup, or review
+the archived old script with the administrator. Do not execute it again.
+
+Choose option 10, or run:
+  bash /root/freepbx-care.sh extensions
+
+Example answers (replace the example property and numbers with the real ones):
+  Enable extension monitoring? y/n [n]:
+    y
+  Extension consecutive failed checks [3]:
+    3
+  Replace property/extension groups? y/n [y]:
+    y
+  How many properties/groups [1]:
+    1 (or the actual number of properties/groups on this server)
+  Property/group 1 name:
+    Red Roof Front Desk (example; enter the actual site/group name)
+  PJSIP extension numbers (spaces or commas):
+    101 102 103 (example; enter the actual selected numbers)
+  Outage mode: all or any [all]:
+    all
+
+Repeat name/numbers/mode for every group when configuring multiple properties.
+Use 'all' for the old behavior: alert only when ALL selected extensions are
+unavailable, recover when AT LEAST ONE is available again. Recovery does not
+mean every extension is back. This is recommended for detecting a property outage.
+Use 'any' when EVERY selected phone is critical: alert if any selected extension
+is unavailable, recover when all are available. To get independent alerts for
+individual phones, create a separate single-extension group for each phone.
+These modes send one outage/recovery notification per group, not repeated email
+on every check or on every additional phone dropping while a group is down.
+
+The wizard previews actual status before saving. Nonexistent IDs, NonQual or
+unknown reachability prevent saving: verify numbers and have the administrator
+review PJSIP qualify settings. NonQual means reachability is not established;
+this tool does not silently treat it as an outage. Known AORs with no contacts
+are unavailable and may be saved. Legacy chan_sip is not supported here.
+
+OPTION 11 - PREVIEW EXTENSION STATUS
+  bash /root/freepbx-care.sh extensions-status
+Option 11 / this command does not send email or restart Asterisk. Check that
+every configured extension has the expected available/unavailable status.
+Then use option 2 if the Care timer is not installed/enabled yet. The existing
+timer runs both checks; no separate cron job or legacy installer is needed.
+
+Extension alerts go to the same recipient/sender set in option 1 and use the
+SMTP relay already configured. They NEVER trigger an Asterisk restart. Three
+consecutive unavailable checks are required by default, then one recovery
+notification when the mode's recovery condition is met. Failed local mail
+submissions are retried; accepted queue submissions still need working SMTP.
+At most five extension notification submissions are attempted per scheduled
+check; additional pending group changes are handled by later checks.
+
+Checks respect the same maintenance/backup pauses and boot/resume grace as
+PBX monitoring. An unhealthy PBX suppresses property checks, avoiding a flood
+of property alerts for a core PBX failure. Repeated failed/unknown PJSIP queries
+generate a separate 'Extension collection' alert instead of false phone outages.
+Use a controlled phone disconnection, with approval, to validate alerts; do not
+stop Asterisk to test an extension alert. Check SMTP logs and actual receipt.
+
+EDIT OR DISABLE EXTENSION MONITORING LATER
+Choose option 10. To edit groups, answer y to replacing groups and enter ALL
+groups you want to keep. Answer n to replacement to retain the displayed list.
+Answer n at the first enable prompt to disable extension checks while retaining
+the group settings. This leaves Asterisk health monitoring enabled. Groups are
+stored locally and preserved by normal updates. Choose stable unique names.
 
 5. SMTP PROMPT ANSWERS
 =====================
@@ -288,6 +365,7 @@ This does not cancel a recovery already running. Enable again with:
 
 Change recipient/recovery settings: menu option 1.
 Change SMTP: option 3, then option 5 and confirm receipt.
+Change/disable extension alerts: option 10; preview with option 11.
 Saved settings apply to later checks; no legacy cleanup is needed.
 
 UPDATE AN EXISTING WORKING FREEPBX CARE INSTALLATION
@@ -373,14 +451,17 @@ responsive Asterisk. Active-channel deferral helps when CLI responds; it cannot
 guarantee call preservation when CLI is unresponsive. Recovery can interrupt
 calls and does not fix the underlying cause of repeated crashes/timeouts.
 
-There is no extension registration polling. Use external monitoring to detect
-a powered-off or unreachable whole server.
+Optional PJSIP reachability polling runs only after local technician setup.
+It observes Asterisk's contact status, not end-to-end call quality; an Avail
+contact does not prove a successful phone call. Use external monitoring to
+detect a powered-off or unreachable whole server.
 
 Operational files (keep credentials and diagnostics private):
   /root/freepbx-care.sh                  Administrator script
   /etc/freepbx-care/config.json          Settings; may contain secrets
   /etc/postfix/freepbx-care-sasl          SMTP credentials, plus its .db file
   /var/lib/freepbx-care/                 State, pauses and setup backups
+  /var/lib/freepbx-care/extensions.json   Persistent extension alert/debounce state
   /var/log/freepbx-care/                 Diagnostics and recovery output
 
 10. GITHUB FILES TO PUBLISH - MAINTAINER

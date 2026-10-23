@@ -17,7 +17,7 @@ import urllib.request
 if sys.argv[0] == '-c': sys.argv = sys.argv[1:]
 URL = 'https://raw.githubusercontent.com/workimirp201/freepbx-script/refs/heads/main/freepbx-care.sh'
 # Refuse changed downloads until a new version has been reviewed.
-EXPECTED_SHA256 = 'f52d603fe29d16a3d38d2d2a9539d4119534af92d68ac948eb542b7a52188e82'
+EXPECTED_SHA256 = '70b6d9c88ed45b77bce788f0551381a481554f9c41d54acb755916cc3912b89f'
 PASSWORD = ''
 PREFLIGHT = r'''
 import sys
@@ -190,6 +190,7 @@ def main():
     print(f'Summary: installed={successful}; skipped={skipped}; failed={failed}')
     print('Existing settings/scripts were backed up inside each CT under /var/lib/freepbx-care/install-backup-*')
     print('No cleanup was rerun. Confirm received emails; failed CTs may have completed some setup steps.')
+    print('Optional extension alerts are configured locally by technicians: bash /root/freepbx-care.sh extensions (menu 10). Existing groups are preserved.')
     return 1 if failed else 0
 
 

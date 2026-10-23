@@ -14,6 +14,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import shutil
 import signal
 import socket
@@ -31,7 +32,7 @@ ETC = Path('/etc/freepbx-care')
 STATE = Path('/var/lib/freepbx-care')
 LOG = Path('/var/log/freepbx-care')
 SELF = Path('/root/freepbx-care.sh')
-VERSION = '2026.10.23-asterisk-smtp-r2'
+VERSION = '2026.10.23-asterisk-smtp-r3'
 DEFAULT = dict(email='monitor@famecomputers.com', sender='', auto_restart=True,
                failures=3, cooldown=1800, max_restarts_hour=2, boot_grace=300,
                resume_grace=180, defer_active_calls=True, ami={})
@@ -416,10 +417,87 @@ def check_legacy_cron():
         raise RuntimeError('Legacy monitor jobs remain. Run cleanup-legacy-freepbx.sh --apply first')
 
 
+def parse_os_release(text):
+    info = {}
+    for line in text.splitlines():
+        if not line.strip() or line.lstrip().startswith('#') or '=' not in line:
+            continue
+        key, value = line.split('=', 1)
+        words = shlex.split(value, comments=True)
+        info[key.strip()] = ' '.join(words)
+    return info
+
+
+def require_supported_platform():
+    info = parse_os_release(Path('/etc/os-release').read_text())
+    if info.get('ID') != 'debian' or info.get('VERSION_ID') != '12':
+        raise RuntimeError('Requires Debian 12 for this FreePBX 17 installer; detected ' +
+                           info.get('ID', 'unknown') + ' ' + info.get('VERSION_ID', 'unknown'))
+    return info
+
+
+def unsafe_apt_suites(text, deb822=False):
+    invalid = []
+    def inspect(uris, suites):
+        if any('debian.org/' in uri or '/debian' in uri or 'deb.freepbx.org/' in uri for uri in uris):
+            invalid.extend(s for s in suites if re.match(r'^(stable|oldstable|testing|unstable|sid|trixie)([-/].*)?$', s))
+    if deb822:
+        for block in re.split(r'\n\s*\n', text):
+            fields = {}
+            key = None
+            for line in block.splitlines():
+                if line.lstrip().startswith('#'): continue
+                if line[:1].isspace() and key:
+                    fields[key] += ' ' + line.strip()
+                elif ':' in line:
+                    key, value = line.split(':', 1)
+                    key = key.lower().strip()
+                    fields[key] = value.strip()
+            if fields.get('enabled', 'yes').lower() != 'no':
+                inspect(fields.get('uris', '').split(), fields.get('suites', '').split())
+    else:
+        for line in text.splitlines():
+            row = shlex.split(line, comments=True)
+            if not row or row[0] not in ['deb', 'deb-src']: continue
+            index = next((i for i, item in enumerate(row) if re.match(r'^(https?|ftp)://', item)), None)
+            if index is not None and index + 1 < len(row): inspect([row[index]], [row[index + 1]])
+    return invalid
+
+
+def check_apt_sources():
+    files = [Path('/etc/apt/sources.list')] + sorted(Path('/etc/apt/sources.list.d').glob('*.list')) + \
+            sorted(Path('/etc/apt/sources.list.d').glob('*.sources'))
+    for path in files:
+        if path.exists():
+            suites = unsafe_apt_suites(path.read_text(), path.suffix == '.sources')
+            if suites:
+                raise RuntimeError(f'Unsafe/moving Debian suite in {path}: {", ".join(suites)}. '
+                                   'Review sources and pin Debian 12/bookworm; no package operation was started')
+
+
+def ami_config_report(c):
+    try:
+        a = ami_credentials(c)
+        return dict(readable=True, host=a.get('host', '127.0.0.1'), port=a.get('port', 5038),
+                    credentials_present=True)
+    except (ValueError, OSError) as e:
+        return dict(readable=False, reason=str(e))
+
+
+def preflight():
+    info = require_supported_platform()
+    print('OS:', info.get('PRETTY_NAME', 'Debian ' + info['VERSION_ID']))
+    check_legacy_cron()
+    c = config()
+    h = health(c)
+    print('Preflight:', json.dumps(h))
+    if not h['healthy']:
+        if h['ami'] == 'config_error': print('AMI configuration:', json.dumps(ami_config_report(c)))
+        raise RuntimeError('Fix CLI/AMI configuration before enabling unattended recovery')
+
+
 def install():
-    osrelease = Path('/etc/os-release').read_text()
-    if 'ID=debian' not in osrelease or 'VERSION_ID="12"' not in osrelease:
-        raise RuntimeError('This installer targets FreePBX 17 on Debian 12')
+    require_supported_platform()
     for cmd in ['fwconsole', 'asterisk', 'php', 'systemctl', 'crontab', 'pgrep']:
         if not shutil.which(cmd):
             raise RuntimeError(f'Required command missing: {cmd}')
@@ -432,6 +510,7 @@ def install():
     h = health(c)
     print('Preflight:', json.dumps(h))
     if not h['healthy']:
+        if h['ami'] == 'config_error': print('AMI configuration:', json.dumps(ami_config_report(c)))
         raise RuntimeError('Preflight failed: fix CLI/AMI configuration before enabling unattended recovery')
     if not Path('/usr/sbin/sendmail').exists():
         raise RuntimeError('Set up SMTP first (menu option 3), then install monitoring')
@@ -492,6 +571,7 @@ def smtp_profile(path):
 
 
 def smtp_setup(profile=None):
+    require_supported_platform()
     c = config()
     host = profile['host'] if profile else ask('SMTP relay DNS hostname (must match its certificate)')
     if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9.-]*', host):
@@ -516,6 +596,7 @@ def smtp_setup(profile=None):
     os.environ['DEBIAN_FRONTEND'] = 'noninteractive'
     try:
         if missing:
+            check_apt_sources()
             checked(['apt-get', 'update'], 180)
             checked(['apt-get', 'install', '-y'] + missing, 300)
     finally:
@@ -616,6 +697,7 @@ def menu():
 def status():
     print('Version:', VERSION)
     print('Current health:', json.dumps(health(config()), indent=2))
+    print('AMI configuration (no secrets):', json.dumps(ami_config_report(config())))
     print('Saved state:', json.dumps(readjson(STATE / 'state.json', {}), indent=2))
     print('Maintenance:', json.dumps(readjson(STATE / 'pause.json', {})))
     print('Backup pause:', json.dumps(readjson(STATE / 'backup-pause.json', {})))
@@ -654,7 +736,7 @@ def resume():
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('command', nargs='?', default='menu', choices=[
-        'menu', 'configure', 'install', 'smtp', 'status', 'diagnose', 'check', 'test-mail',
+        'menu', 'configure', 'install', 'preflight', 'smtp', 'status', 'diagnose', 'check', 'test-mail',
         'pause', 'resume', 'backup-pause', 'backup-resume', 'disable'])
     parser.add_argument('--minutes', type=int, default=60)
     parser.add_argument('--smtp-config', help='root-owned mode-600 SMTP profile JSON')
@@ -676,6 +758,7 @@ def main():
             tick(config())
         elif args.command == 'configure': configure()
         elif args.command == 'install': install()
+        elif args.command == 'preflight': preflight()
         elif args.command == 'smtp': smtp_setup(smtp_profile(args.smtp_config) if args.smtp_config else None)
         elif args.command == 'status': status()
         elif args.command == 'diagnose': print('Diagnostics saved:', snapshot(health(config())))

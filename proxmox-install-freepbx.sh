@@ -17,8 +17,15 @@ import urllib.request
 if sys.argv[0] == '-c': sys.argv = sys.argv[1:]
 URL = 'https://raw.githubusercontent.com/workimirp201/freepbx-script/refs/heads/main/freepbx-care.sh'
 # Refuse changed downloads until a new version has been reviewed.
-EXPECTED_SHA256 = '2083706807073be42699e36f44c8b1f973357acc0a493b8fad4bd264404ac031'
+EXPECTED_SHA256 = 'f52d603fe29d16a3d38d2d2a9539d4119534af92d68ac948eb542b7a52188e82'
 PASSWORD = ''
+PREFLIGHT = r'''
+import sys
+source = sys.stdin.read()
+code = source.split("<<'PYTHON'\n", 1)[1].rsplit('\nPYTHON\n', 1)[0]
+sys.argv = ['/root/freepbx-care.sh', 'preflight']
+exec(compile(code, 'freepbx-care.sh:preflight', 'exec'), {'__name__': '__main__'})
+'''
 
 
 def run(args, timeout=60, data=None):
@@ -108,12 +115,16 @@ print(name)
 def deploy(ctid, script, smtp, settings):
     profile = None
     try:
+        print(f'CT {ctid}: checking OS, existing cron and CLI/AMI before changing settings...', flush=True)
+        run(['pct', 'exec', ctid, '--', 'python3', '-c', PREFLIGHT], data=script, timeout=90)
         profile = run(['pct', 'exec', ctid, '--', 'python3', '-c', PREPARE],
                       data=json.dumps(dict(script=script, smtp=smtp, settings=settings)))
         if not re.fullmatch(r'/root/\.freepbx-care-smtp-[A-Za-z0-9_-]+\.json', profile):
             raise RuntimeError('Unexpected SMTP staging filename; no setup command was run')
         base = ['pct', 'exec', ctid, '--', '/bin/bash', '/root/freepbx-care.sh']
+        print(f'CT {ctid}: configuring SMTP; package installation can take several minutes...', flush=True)
         run(base + ['smtp', '--smtp-config', profile], timeout=900)
+        print(f'CT {ctid}: installing monitoring...', flush=True)
         run(base + ['install'], timeout=180)
         run(base + ['test-mail'], timeout=60)
         print(f'CT {ctid}: installed; test email accepted by the local queue. Confirm receipt.')
@@ -135,10 +146,12 @@ def main():
         parser.error('Run as root on a Proxmox host')
     if args.all_running_freepbx and args.ctids: parser.error('Choose all or explicit CTIDs')
     if any(not x.isdigit() for x in args.ctids): parser.error('CTIDs must be numeric')
+    print('Listing containers on this Proxmox node...', flush=True)
     ctids = select_ctids(run(['pct', 'list'])) if args.all_running_freepbx else list(dict.fromkeys(args.ctids))
     if not ctids: parser.error('Specify CTIDs or --all-running-freepbx')
     targets, skipped, failed = [], [], []
-    for ctid in ctids:
+    for index, ctid in enumerate(ctids, 1):
+        print(f'Checking CT {ctid} ({index}/{len(ctids)})...', flush=True)
         try:
             if run(['pct', 'status', ctid], timeout=15) != 'status: running':
                 skipped.append(ctid); continue

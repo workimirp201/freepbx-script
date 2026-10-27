@@ -28,15 +28,32 @@ if sys.argv[0] == '-c':
 __file__ = sys.argv[0]
 
 os.environ['PATH'] = '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
+os.environ['LC_ALL'] = 'C'
 ETC = Path('/etc/freepbx-care')
 STATE = Path('/var/lib/freepbx-care')
 LOG = Path('/var/log/freepbx-care')
 SELF = Path('/root/freepbx-care.sh')
-VERSION = '2026.10.23-extensions-r4'
+VERSION = '2026.10.27-module-review-r6'
 DEFAULT = dict(email='monitor@famecomputers.com', sender='', auto_restart=True,
                failures=3, cooldown=1800, max_restarts_hour=2, boot_grace=300,
                resume_grace=180, defer_active_calls=True, ami={},
-               extension_monitor=dict(enabled=False, failures=3, groups=[]))
+               extension_monitor=dict(enabled=False, failures=3, groups=[]),
+               auto_start_mariadb=True, monitor_fastagi=False)
+
+# Only these optional features can be changed through this helper. Absence of
+# activity does NOT prove a module is unused. Everything else remains audit-only.
+OPTIONAL_MODULES = {
+    'sangomacrm': 'CRM integration - confirmed unused for this fleet; still check site exceptions.',
+    'zulu': 'Zulu desktop/mobile client - verify no users or integrations use it.',
+    'sangomaconnect': 'Sangoma Connect softphones - verify no users use this service.',
+    'sangomartapi': 'Sangoma real-time API - verify no connected clients/integrations need it.',
+    'restapps': 'Phone applications - verify phones do not use these apps.',
+    'ucp': 'User Control Panel - verify users do not use web voicemail, calls or other UCP features.',
+    'faxpro': 'Advanced fax features - verify no fax workflows use it.',
+    'fax': 'Fax support - verify no inbound/outbound fax workflows use it.',
+    'xmpp': 'Chat/messaging integration - verify no users/integrations use it.',
+    'recording_report': 'Call recording reports - verify no users use this reporting interface.',
+}
 
 
 def run(args, timeout=15, data=None, kill_group=True):
@@ -126,7 +143,7 @@ def validate(c):
                            ('resume_grace', 60, 900)]:
         if type(c[key]) is not int or not low <= c[key] <= high:
             raise ValueError(f'Invalid {key}: expected {low}..{high}')
-    for key in ['auto_restart', 'defer_active_calls']:
+    for key in ['auto_restart', 'defer_active_calls', 'auto_start_mariadb', 'monitor_fastagi']:
         if type(c[key]) is not bool:
             raise ValueError(f'{key} must be boolean')
     validate_extensions(c['extension_monitor'])
@@ -464,12 +481,305 @@ def ami_probe(c):
         return 'unreachable'
 
 
+def database_health():
+    """Check the local dependency without bootstrapping FreePBX or exposing credentials."""
+    try:
+        rc, out, _ = run(['systemctl', 'show', 'mariadb.service', '--all',
+                         '--property=LoadState,ActiveState,UnitFileState,Job'], 5)
+        fields = dict(line.split('=', 1) for line in out.splitlines() if '=' in line)
+        required = {'LoadState', 'ActiveState', 'UnitFileState', 'Job'}
+        if rc or not required.issubset(fields) or fields['LoadState'] != 'loaded':
+            return dict(healthy=False, state='unknown', startable=False)
+        active = fields['ActiveState']
+        result = dict(healthy=False, state=active, startable=(
+            active in ['inactive', 'failed'] and fields['UnitFileState'] in ['enabled', 'enabled-runtime']
+            and fields['Job'] in ['', '0']))
+        if active == 'active':
+            admin = shutil.which('mariadb-admin') or shutil.which('mysqladmin')
+            if not admin:
+                result['state'] = 'probe_unavailable'
+            else:
+                rc, out, _ = run([admin, '--protocol=socket', '--connect-timeout=3', 'ping'], 5)
+                result['healthy'] = rc == 0 and bool(re.search(r'\b(?:mysqld|mariadbd) is alive\b', out))
+                result['state'] = 'healthy' if result['healthy'] else 'unresponsive'
+        return result
+    except (OSError, ValueError):
+        return dict(healthy=False, state='unknown', startable=False)
+
+
 def health(c):
+    database = database_health()
     rc, out, _ = cli('core show uptime seconds')
     cli_ok = rc == 0 and bool(re.search(r'System uptime:\s*\d+', out))
-    ami = ami_probe(c)
-    return dict(cli=cli_ok, ami=ami, healthy=cli_ok and ami == 'healthy',
-                restartable=(not cli_ok or ami == 'unreachable'))
+    ami = ami_probe(c) if database['healthy'] else 'database_unavailable'
+    return dict(cli=cli_ok, ami=ami, database=database,
+                healthy=database['healthy'] and cli_ok and ami == 'healthy',
+                restartable=database['healthy'] and (not cli_ok or ami == 'unreachable'))
+
+
+def database_tick(c, st, h, statepath):
+    """Only start a stopped, enabled local unit. Never restart a running database."""
+    database = h['database']
+    if database['healthy']:
+        st['database_failures'] = 0
+        transition(c, st, 'MariaDB', 'healthy', 'Local MariaDB service and socket ping passed.')
+        return False
+    st['database_failures'] = st.get('database_failures', 0) + 1
+    if st['database_failures'] < c['failures']:
+        return False
+    transition(c, st, 'MariaDB', 'outage', json.dumps(database) +
+               '\nDatabase dependency unavailable; Asterisk recovery is deferred.')
+    now = time.time()
+    attempts = [t for t in st.get('database_starts', []) if now - t < 3600]
+    allowed = (c['auto_restart'] and c['auto_start_mariadb'] and database['startable'] and
+               not st.get('database_recovery_blocked') and not st.get('recovery_blocked') and
+               now - st.get('last_database_start', 0) >= c['cooldown'] and
+               len(attempts) < c['max_restarts_hour'])
+    if not allowed:
+        log('MariaDB start deferred: state, policy, cooldown, limit or recovery latch')
+        return False
+    evidence = snapshot(h)
+    # Recheck after collecting evidence; never race a service stop/start or a mask/disable.
+    current = database_health()
+    if not current['startable']:
+        log('MariaDB state changed during diagnostics; no start requested')
+        return True  # Re-evaluate full health, including a possible independent recovery.
+    st.update(last_database_start=now, database_starts=attempts + [now], database_failures=0)
+    save(statepath, st)
+    rc, out, err = run(['systemctl', 'start', 'mariadb.service'], 120, kill_group=False)
+    if rc == 124:
+        st['database_recovery_blocked'] = True
+        save(statepath, st)
+    atomic(LOG / 'last-database-start.log', f'exit={rc}\n{out}\n{err}')
+    after = database_health()
+    st['last_database_start_result'] = dict(exit=rc, database=after, time=time.time(), evidence=str(evidence))
+    save(statepath, st)
+    notify(c, 'MariaDB start attempted', f'systemctl start mariadb.service exit={rc}; '
+           f'post-check={json.dumps(after)}; evidence={evidence}; Asterisk was not restarted.')
+    return True
+
+
+def fastagi_health():
+    """TCP listener check only; it does not execute an AGI script or prove CRM correctness."""
+    try:
+        with socket.create_connection(('127.0.0.1', 4573), 2):
+            return True
+    except OSError:
+        return False
+
+
+def fastagi_tick(c, st, pbx_healthy):
+    if not c['monitor_fastagi'] or not pbx_healthy:
+        st['fastagi_failures'] = 0
+        return
+    listening = fastagi_health()
+    st['last_fastagi'] = dict(listening=listening, time=time.time())
+    if listening:
+        st['fastagi_failures'] = 0
+        transition(c, st, 'CRM FastAGI', 'healthy', 'TCP listener at 127.0.0.1:4573 is reachable again; verify CRM calls.')
+    else:
+        st['fastagi_failures'] = st.get('fastagi_failures', 0) + 1
+        if st['fastagi_failures'] >= c['failures']:
+            transition(c, st, 'CRM FastAGI', 'outage',
+                       'Expected TCP listener at 127.0.0.1:4573 is unreachable. '
+                       'Review Sangoma CRM / PM2. No modules were disabled and Asterisk was not restarted.')
+
+
+def configure_services():
+    c = config()
+    print('MariaDB: start-only recovery for a stopped, enabled local service; global recovery policy also applies.')
+    print('FastAGI: optional alerts only. Enable only when Sangoma CRM is intentionally in use.')
+    for key, label in [('auto_start_mariadb', 'Automatically start stopped MariaDB? y/n'),
+                       ('monitor_fastagi', 'Expect CRM FastAGI on 127.0.0.1:4573? y/n')]:
+        answer = ask(label, 'y' if c[key] else 'n').lower()
+        if answer not in ['y', 'n']:
+            raise ValueError('Answer y or n')
+        c[key] = answer == 'y'
+    validate(c)
+    save(ETC / 'config.json', c)
+    st = readjson(STATE / 'state.json', {})
+    st.update(database_failures=0, fastagi_failures=0)
+    save(STATE / 'state.json', st)
+    print('Service settings saved. No service or module was changed.')
+
+
+def module_records(text):
+    """fwconsole --format=json emits one JSON record per output line."""
+    records = []
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        try:
+            item = json.loads(line)
+        except ValueError:
+            raise RuntimeError('Unrecognized module-admin output; inspect native fwconsole ma list before proceeding') from None
+        if (not isinstance(item, dict) or item.get('status') is not True or
+                item.get('type') == 'error' or 'data' not in item):
+            raise RuntimeError('Module-admin reported an error; no dependency bypass is allowed')
+        records.append(item)
+    if not records:
+        raise RuntimeError('Module-admin returned no structured result')
+    return records
+
+
+def module_inventory():
+    rc, out, _ = run(['fwconsole', 'ma', 'list', '--format=json', '--no-ansi', '--no-interaction'],
+                     90, kill_group=False)
+    if rc:
+        raise RuntimeError(f'Module inventory failed (exit {rc}); review native fwconsole ma list')
+    inventories = [r['data'] for r in module_records(out) if isinstance(r['data'], list)]
+    if len(inventories) != 1:
+        raise RuntimeError('Ambiguous module inventory; no changes allowed')
+    inventory = {}
+    for row in inventories[0]:
+        if (not isinstance(row, list) or len(row) < 3 or
+                not all(isinstance(value, str) for value in row[:3]) or
+                not re.fullmatch(r'[a-z][a-z0-9_-]{0,63}', row[0]) or row[0] in inventory):
+            raise RuntimeError('Invalid module inventory row; no changes allowed')
+        inventory[row[0]] = dict(version=row[1], status=row[2])
+    return inventory
+
+
+def check_reverse_dependencies(name):
+    rc, out, _ = run(['fwconsole', 'ma', 'reversedepends', name, '--format=json',
+                     '--no-ansi', '--no-interaction'], 60, kill_group=False)
+    if rc:
+        raise RuntimeError(f'Reverse dependency check blocked {name} (exit {rc}); review fwconsole ma reversedepends {name}')
+    records = module_records(out)
+    if not any(r['data'] == 'No enabled modules depend on this module.' for r in records):
+        raise RuntimeError('No positive reverse-dependency clearance; no changes allowed')
+
+
+def show_module_audit(inventory=None):
+    inventory = module_inventory() if inventory is None else inventory
+    print('Installed/local module inventory. Enabled does not mean used; disabled does not mean uninstalled.')
+    for name, info in sorted(inventory.items()):
+        category = 'OPTIONAL - REVIEW USAGE' if name in OPTIONAL_MODULES else 'PROTECTED / AUDIT ONLY'
+        print(f"{name:24} {info['version']:14} {info['status']:30} {category}")
+    print('\nOptional feature impacts (only consider installed/enabled entries):')
+    for name, impact in OPTIONAL_MODULES.items():
+        if name in inventory:
+            print(f'  {name}: {impact}')
+    print('Only CRM is confirmed unused for this fleet. Other entries require site-specific confirmation.')
+    print('Disabling a module may not stop its existing process or measurably reduce resource use.')
+    return inventory
+
+
+def verify_module_change(before, after, selected):
+    if selected not in after or after[selected]['status'] != 'Disabled':
+        raise RuntimeError('Selected module did not reach Disabled status; administrator review required')
+    for name, info in before.items():
+        if name != selected and after.get(name) != info:
+            raise RuntimeError(f'Another module changed ({name}); stop and review the saved inventory')
+    if set(after) != set(before):
+        raise RuntimeError('Module inventory changed concurrently; stop and review')
+
+
+def require_idle_calls():
+    rc, out, _ = cli('core show channels count')
+    channels = re.search(r'(?m)^\s*(\d+) active channels?\b', out)
+    if rc or not channels or int(channels[1]) != 0:
+        raise RuntimeError('Module change refused: active calls or channel count unknown; retry during maintenance')
+
+
+def apply_module_disable(name, expected):
+    """Caller holds operation_lock. One selected module; no force, uninstall or restart."""
+    if name not in OPTIONAL_MODULES:
+        raise ValueError('Module is protected or not on the reviewed optional-feature list')
+    pending = STATE / 'module-change-pending.json'
+    if pending.exists() or fwconsole_busy():
+        raise RuntimeError('A module change/fwconsole operation is pending; finish/review it first')
+    before = module_inventory()
+    if before.get(name) != expected or expected.get('status') != 'Enabled':
+        raise RuntimeError('Selected module changed or is not Enabled; run the audit again')
+    if not health(config())['healthy']:
+        raise RuntimeError('Fix MariaDB/CLI/AMI health before changing modules')
+    require_idle_calls()
+    check_reverse_dependencies(name)
+    stamp = datetime.datetime.now().strftime('%Y%m%d-%H%M%S-%f')
+    backup = STATE / ('module-change-' + stamp)
+    backup.mkdir(mode=0o700, parents=True)
+    save(backup / 'inventory-before.json', before)
+    settings = ETC / 'config.json'
+    if settings.exists():
+        if settings.is_symlink() or not settings.is_file():
+            raise RuntimeError('Refusing a nonregular monitor configuration backup')
+        shutil.copy2(settings, backup / 'monitor-config.json')
+        os.chmod(backup / 'monitor-config.json', 0o600)
+    atomic(backup / 'RESTORE.txt', f'Previous module was Enabled. After administrator review:\n'
+           f'fwconsole ma enable {name}\nfwconsole reload\n'
+           'bash /root/freepbx-care.sh status\nbash /root/freepbx-care.sh resume\n'
+           'If a fwconsole operation timed out, check it has finished before further changes.\n'
+           'This directory is an inventory/settings backup, not a full PBX/database backup.\n')
+    record = dict(module=name, backup=str(backup), stage='disable requested', time=time.time())
+    try:
+        # Check again immediately before mutation; native disable checks dependencies again too.
+        check_reverse_dependencies(name)
+        if fwconsole_busy():
+            raise RuntimeError('Another fwconsole operation started; no module command requested')
+        require_idle_calls()
+        save(pending, record)  # Persist before mutation, including across timeouts/reboots.
+        rc, out, err = run(['fwconsole', 'ma', 'disable', name, '--format=json',
+                            '--no-ansi', '--no-interaction'], 120, kill_group=False)
+        atomic(backup / 'disable.log', f'exit={rc}\n{out}\n{err}')
+        if rc:
+            raise RuntimeError(f'Module disable failed/timed out (exit {rc})')
+        records = module_records(out)
+        if not any(r['data'] == f'Module {name} successfully disabled' for r in records):
+            raise RuntimeError('Module-admin did not confirm the selected disable')
+        verify_module_change(before, module_inventory(), name)
+        record['stage'] = 'reload requested'
+        save(pending, record)
+        rc, out, err = run(['fwconsole', 'reload', '--no-ansi', '--no-interaction'], 180, kill_group=False)
+        atomic(backup / 'reload.log', f'exit={rc}\n{out}\n{err}')
+        if rc:
+            raise RuntimeError(f'Configuration reload failed/timed out (exit {rc})')
+        after = module_inventory()
+        verify_module_change(before, after, name)
+        final_health = health(config())
+        if not final_health['healthy']:
+            raise RuntimeError('Health check failed after reload; inspect diagnostics before further changes')
+        if name == 'sangomacrm':
+            c = config()
+            c['monitor_fastagi'] = False
+            save(ETC / 'config.json', c)
+        save(backup / 'result.json', dict(module=name, inventory=after, health=final_health, completed=True))
+        pending.unlink()
+        print(f'{name} disabled and configuration reloaded. Backup/audit: {backup}')
+        print('Test calls and affected features. Existing manual/backup pauses remain unchanged.')
+    except Exception:
+        if pending.exists():
+            print(f'Module operation needs review. Monitoring is held by {pending}. Evidence: {backup}')
+            print('Do not repeat commands blindly. Review RESTORE.txt and any continuing fwconsole process;')
+            print('after resolving it and confirming PBX health, run resume to clear the module-change hold.')
+        else:
+            print(f'No module command requested; pre-change checks failed. Audit directory: {backup}')
+        raise
+
+
+def module_review():
+    inventory = show_module_audit()
+    print('\nOne module at a time. Have a current PBX backup and an approved maintenance window.')
+    name = ask('Unused optional module to disable (Enter = audit only)')
+    if not name:
+        return
+    if name not in OPTIONAL_MODULES or name not in inventory or inventory[name]['status'] != 'Enabled':
+        raise ValueError('Select an installed, Enabled optional module from the reviewed list')
+    print(f'Proposed: disable {name}, then reload FreePBX configuration. Impact: {OPTIONAL_MODULES[name]}')
+    print('No dependency bypass, module deletion or Asterisk restart will be requested.')
+    if ask(f'Type DISABLE {name} to confirm this feature is unused and apply', '') != f'DISABLE {name}':
+        print('Cancelled; no module changes made.')
+        return
+    with operation_lock():
+        apply_module_disable(name, inventory[name])
+
+
+def crash_audit():
+    print('Crash review: memory/OOM and swap pressure; disk space AND inodes; CPU quotas/I/O stalls;')
+    print('failed services, overlapping legacy jobs, backups, module/OS updates, and SIP/security incidents.')
+    print('High usage, historical OOM counters, or an installed module alone do not prove the cause.')
+    print('Read-only evidence; no services/modules restarted/disabled and no files purged.')
+    print('Diagnostics saved:', snapshot(health(config())))
 
 
 def fwconsole_busy():
@@ -499,20 +809,31 @@ def snapshot(h):
     stamp = datetime.datetime.now().strftime('%Y%m%d-%H%M%S-%f')
     dest = LOG / f'incident-{stamp}.log'
     chunks = [json.dumps(h)]
-    for cmd in [['asterisk', '-rx', 'core show uptime'],
+    deadline = time.monotonic() + 45
+    for cmd in [['free', '-m'], ['df', '-h', '/', '/var'], ['df', '-i', '/', '/var'],
+                ['cat', '/sys/fs/cgroup/memory.events', '/sys/fs/cgroup/memory.current',
+                 '/sys/fs/cgroup/memory.max', '/sys/fs/cgroup/cpu.stat', '/sys/fs/cgroup/pids.events',
+                 '/sys/fs/cgroup/pids.current', '/sys/fs/cgroup/pids.max'],
+                ['cat', '/sys/fs/cgroup/cpu.max', '/sys/fs/cgroup/cpuset.cpus.effective',
+                 '/sys/fs/cgroup/cpu.pressure', '/sys/fs/cgroup/memory.pressure', '/sys/fs/cgroup/io.pressure'],
+                ['journalctl', '-k', '-n', '100', '--no-pager'],
+                ['asterisk', '-rx', 'core show uptime'],
                 ['asterisk', '-rx', 'core show channels count'],
                 ['asterisk', '-rx', 'manager show settings'],
                 ['systemctl', 'status', 'incron', 'mariadb', 'freepbx', 'apache2', '--no-pager'],
+                ['systemctl', '--failed', '--no-pager'],
+                ['ss', '-lntp'],
                 ['journalctl', '-u', 'incron', '-u', 'mariadb', '-u', 'freepbx',
                  '-u', 'apache2', '-n', '100', '--no-pager'],
                 ['tail', '-n', '150', '/var/log/asterisk/full'],
                 ['ps', '-eo', 'pid,ppid,user,stat,etimes,comm'],
                 ['systemd-detect-virt', '--container'],
-                ['cat', '/sys/fs/cgroup/memory.events', '/sys/fs/cgroup/memory.current',
-                 '/sys/fs/cgroup/memory.max', '/sys/fs/cgroup/cpu.stat'],
-                ['df', '-h', '/', '/var'], ['free', '-m'],
-                ['journalctl', '-k', '-n', '40', '--no-pager']]:
-        rc, out, err = run(cmd, 5)
+                ['uptime']]:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            chunks.append('\nDiagnostic time budget reached; remaining commands skipped.')
+            break
+        rc, out, err = run(cmd, min(5, remaining))
         chunks.append(f'\n$ {" ".join(cmd)} (exit {rc})\n{out}{err}')
     atomic(dest, '\n'.join(chunks))
     # Bound storage, retaining the most recent twenty incidents.
@@ -527,26 +848,40 @@ def tick(c):
     now = time.time()
     boot = Path('/proc/sys/kernel/random/boot_id').read_text().strip()
     if st.get('boot') != boot:
-        st.update(boot=boot, failures=0)
+        st.update(boot=boot, failures=0, database_failures=0, fastagi_failures=0)
         reset_extension_debounce(c)
     # Long scheduling gaps can follow LXC suspension, backup or host overload.
     gap = now - st.get('last_observed', now)
     if gap > 300:
-        st.update(failures=0, settle_until=now + c['resume_grace'])
+        st.update(failures=0, database_failures=0, fastagi_failures=0, settle_until=now + c['resume_grace'])
         reset_extension_debounce(c)
     st['last_observed'] = now
     uptime = float(Path('/proc/uptime').read_text().split()[0])
     paused = (readjson(STATE / 'pause.json', {}).get('until', 0) > now or
               readjson(STATE / 'backup-pause.json', {}).get('until', 0) > now)
-    if paused or uptime < c['boot_grace'] or st.get('settle_until', 0) > now or fwconsole_busy():
+    if (paused or uptime < c['boot_grace'] or st.get('settle_until', 0) > now or fwconsole_busy() or
+            (STATE / 'module-change-pending.json').exists()):
         st['failures'] = 0
+        st.update(database_failures=0, fastagi_failures=0)
         reset_extension_debounce(c)
         save(statepath, st)
-        log('Monitoring skipped: pause, boot/resume grace, or another fwconsole operation')
+        log('Monitoring skipped: pause, boot/resume grace, fwconsole operation, or pending module review')
         return
     h = health(c)
-    log(f"Health: CLI={h['cli']} AMI={h['ami']}")
+    if not h['database']['healthy']:
+        st['failures'] = 0  # Never count a database dependency outage toward an Asterisk restart.
+    if database_tick(c, st, h, statepath):
+        h = health(c)
+        if h['database']['healthy']:
+            database_tick(c, st, h, statepath)
+    log(f"Health: CLI={h['cli']} AMI={h['ami']} MariaDB={h['database']['state']}")
     st['last_health'] = dict(h, time=now)
+    if not h['database']['healthy']:
+        st['fastagi_failures'] = 0
+        reset_extension_debounce(c)
+        save(statepath, st)
+        log('Asterisk/extension/CRM recovery checks deferred: database dependency unavailable')
+        return
     if h['healthy']:
         st['failures'] = 0
         transition(c, st, 'PBX', 'healthy', 'CLI and authenticated AMI Ping passed.')
@@ -588,6 +923,7 @@ def tick(c):
                 log(f'Restart completed: exit={rc}; health={after}')
             elif not h['restartable']:
                 log('Configuration/authentication/protocol problem: automatic restart suppressed')
+    fastagi_tick(c, st, h['healthy'])
     save(statepath, st)
     # Optional extension checks run after the core watchdog and cannot request recovery.
     try:
@@ -720,7 +1056,7 @@ def preflight():
     print('Preflight:', json.dumps(h))
     if not h['healthy']:
         if h['ami'] == 'config_error': print('AMI configuration:', json.dumps(ami_config_report(c)))
-        raise RuntimeError('Fix CLI/AMI configuration before enabling unattended recovery')
+        raise RuntimeError('Fix MariaDB/CLI/AMI health before enabling unattended recovery')
 
 
 def install():
@@ -738,7 +1074,7 @@ def install():
     print('Preflight:', json.dumps(h))
     if not h['healthy']:
         if h['ami'] == 'config_error': print('AMI configuration:', json.dumps(ami_config_report(c)))
-        raise RuntimeError('Preflight failed: fix CLI/AMI configuration before enabling unattended recovery')
+        raise RuntimeError('Preflight failed: fix MariaDB/CLI/AMI health before enabling unattended recovery')
     if not Path('/usr/sbin/sendmail').exists():
         raise RuntimeError('Set up SMTP first (menu option 3), then install monitoring')
     check_legacy_cron()
@@ -897,6 +1233,9 @@ def operation_lock():
 
 
 def menu_action(choice):
+    if choice == '13':
+        module_review()  # Do not hold the watchdog lock while waiting for technician input.
+        return
     with operation_lock():
         if choice == '1': configure()
         elif choice == '2': install()
@@ -909,11 +1248,13 @@ def menu_action(choice):
         elif choice == '9': print('Diagnostics saved:', snapshot(health(config())))
         elif choice == '10': configure_extensions()
         elif choice == '11': print('Extension status (no email/restart):', json.dumps(extension_report(config()), indent=2))
+        elif choice == '12': configure_services()
+        elif choice == '14': crash_audit()
 
 
 def menu():
     while True:
-        print(f'\nFreePBX Care {VERSION}\n1 Configure Asterisk monitor\n2 Install/update monitoring\n3 Configure SMTP relay\n4 Read-only health/status\n5 Send test email\n6 Pause monitoring\n7 Resume monitoring\n8 Disable monitoring\n9 Collect diagnostics (no restart)\n10 Configure extension monitoring\n11 Read-only extension status\n0 Exit')
+        print(f'\nFreePBX Care {VERSION}\n1 Configure Asterisk monitor\n2 Install/update monitoring\n3 Configure SMTP relay\n4 Read-only health/status\n5 Send test email\n6 Pause monitoring\n7 Resume monitoring\n8 Disable monitoring\n9 Collect diagnostics (no restart)\n10 Configure extension monitoring\n11 Read-only extension status\n12 Configure MariaDB / CRM checks\n13 Review/disable unused optional modules\n14 Investigate crash/resource issues\n0 Exit')
         choice = ask('Choose', '0')
         if choice == '0':
             return
@@ -930,8 +1271,13 @@ def status():
     print('Saved state:', json.dumps(readjson(STATE / 'state.json', {}), indent=2))
     print('Maintenance:', json.dumps(readjson(STATE / 'pause.json', {})))
     print('Backup pause:', json.dumps(readjson(STATE / 'backup-pause.json', {})))
+    print('Pending module-change hold:', json.dumps(readjson(STATE / 'module-change-pending.json', {})))
     print('Extension settings:', json.dumps(config()['extension_monitor'], indent=2))
     print('Saved extension state:', json.dumps(readjson(STATE / 'extensions.json', {}), indent=2))
+    c = config()
+    print('MariaDB automatic start:', c['auto_start_mariadb'], '(requires automatic recovery enabled)')
+    print('CRM FastAGI:', json.dumps(dict(monitored=c['monitor_fastagi'],
+          listening=fastagi_health() if c['monitor_fastagi'] else None)))
     rc, out, err = run(['systemctl', 'status', 'freepbx-care.timer', '--no-pager'])
     print(out, err)
 
@@ -957,18 +1303,25 @@ def backup_pause(minutes):
 
 
 def resume():
+    pending = STATE / 'module-change-pending.json'
+    if pending.exists():
+        if fwconsole_busy() or not health(config())['healthy']:
+            raise RuntimeError('Module-change hold retained: finish fwconsole work and restore MariaDB/CLI/AMI health first')
+        pending.unlink()
     save(STATE / 'pause.json', dict(until=0))
     st = readjson(STATE / 'state.json', {})
-    st.update(recovery_blocked=False, failures=0)
+    st.update(recovery_blocked=False, database_recovery_blocked=False, failures=0,
+              database_failures=0, fastagi_failures=0)
     save(STATE / 'state.json', st)
-    print('Manual pause and recovery timeout latch cleared. Backup pause remains independent.')
+    print('Manual pause, reviewed module-change hold and recovery timeout latches cleared. Backup pause remains independent.')
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('command', nargs='?', default='menu', choices=[
         'menu', 'configure', 'install', 'preflight', 'smtp', 'status', 'diagnose', 'check', 'test-mail',
-        'pause', 'resume', 'backup-pause', 'backup-resume', 'disable', 'extensions', 'extensions-status'])
+        'pause', 'resume', 'backup-pause', 'backup-resume', 'disable', 'extensions', 'extensions-status', 'services',
+        'modules', 'module-audit', 'crash-audit'])
     parser.add_argument('--minutes', type=int, default=60)
     parser.add_argument('--smtp-config', help='root-owned mode-600 SMTP profile JSON')
     parser.add_argument('--version', action='version', version=VERSION)
@@ -982,6 +1335,9 @@ def main():
     if args.command == 'menu':
         menu()
         return
+    if args.command == 'modules':
+        module_review()
+        return
     with operation_lock():
         if args.command == 'check':
             if not (ETC / 'config.json').exists():
@@ -989,6 +1345,9 @@ def main():
             tick(config())
         elif args.command == 'configure': configure()
         elif args.command == 'extensions': configure_extensions()
+        elif args.command == 'services': configure_services()
+        elif args.command == 'module-audit': show_module_audit()
+        elif args.command == 'crash-audit': crash_audit()
         elif args.command == 'extensions-status': print(json.dumps(extension_report(config()), indent=2))
         elif args.command == 'install': install()
         elif args.command == 'preflight': preflight()

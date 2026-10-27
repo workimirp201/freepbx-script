@@ -1,5 +1,5 @@
 FREEPBX CARE - STANDALONE SERVER INSTRUCTIONS
-Prepared: 2026-10-27 | Script: 2026.10.27-module-review-r6
+Prepared: 2026-10-27 | Script: 2026.10.27-module-menu-r7
 
 Run every command directly ON THE PBX SERVER as root, over SSH or its console.
 This tool configures monitoring and outgoing email for an existing FreePBX
@@ -47,7 +47,7 @@ Download the main script. Copy the full command, including the && lines:
 Check the version:
   bash /root/freepbx-care.sh --version
 
-This guide matches 2026.10.27-module-review-r6. Use matching instructions if a
+This guide matches 2026.10.27-module-menu-r7. Use matching instructions if a
 later release changes the prompts. If a download or syntax check fails, stop
 and resolve the error before proceeding.
 
@@ -137,7 +137,8 @@ Menu options:
 Recommended order: 1 -> 3 -> 5 -> 4 -> 2 -> 0.
 When extension alerts are required, use 1 -> 3 -> 5 -> 10 -> 11 -> 4 -> 2 -> 0.
 Review option 12 before installation: for this fleet use MariaDB y, CRM n.
-Optional module review is option 13; Enter at its selection prompt audits only.
+Optional module review is option 13: choose a feature number, A for a full audit,
+or 0/Enter to return without changes.
 Wait for actual test-email receipt before enabling monitoring with option 2.
 If intentionally keeping already verified SMTP on an old server, skip option 3
 but still do option 5 and confirm receipt. After an SMTP reset, option 3 is
@@ -325,8 +326,10 @@ Read-only inventory, with optional-feature explanations:
 Interactive review/disable (also menu 13):
   bash /root/freepbx-care.sh modules
 
-The helper displays installed/local modules and their versions/status. Only
-these optional features may be disabled here, when installed AND Enabled:
+The interactive screen shows a short numbered list of enabled optional features
+with readable names. Already disabled features are shown separately and cannot
+be selected again. A displays the complete installed/local inventory. Only these
+optional features may be disabled here, when installed AND Enabled:
   sangomacrm       CRM integration; confirmed unused in this fleet
   zulu             Zulu desktop/mobile client
   sangomaconnect   Sangoma Connect softphones
@@ -349,15 +352,23 @@ Everything else is protected/audit-only here, including framework, core, PM2,
 firewall, user management, sysadmin, voicemail and routing/calling modules.
 Never stop all Node/PM2 processes or disable the firewall to free memory.
 
-Example for the confirmed unused CRM integration:
-  Unused optional module to disable (Enter = audit only):
-    sangomacrm
-The script displays the exact proposed change and feature impact. To apply:
-  Type DISABLE sangomacrm to confirm this feature is unused and apply:
-    DISABLE sangomacrm
+Example while the confirmed unused CRM integration is still enabled:
+  1. Sangoma CRM - confirmed unused in this fleet
+  ... other available features ...
+  A. View full module audit
+  0. Back without changes
+  Choose a feature number [0]:
+    1
+The script shows the selected feature and its impact, then asks:
+  Disable this unused feature and reload configuration? y/n [n]:
+    y
 
-Enter at the first prompt leaves modules unchanged. Any other confirmation
-cancels. If a dependency, unhealthy PBX, active calls, unknown channel count,
+Use the number actually displayed for the intended feature. Numbers can change
+as modules become disabled; do not reuse an old number blindly. If CRM is already
+disabled it is not offered again. No module names or long confirmation phrases
+need to be typed. Yes/y applies; no/n or Enter cancels. Invalid entries re-prompt.
+At selection, 0 or Enter leaves modules unchanged; A shows the full audit.
+If a dependency, unhealthy PBX, active calls, unknown channel count,
 unsupported output format or concurrent operation blocks the change, stop for
 review rather than bypassing it. Native reverse-dependency checks run before
 disable, and native disable also checks dependencies. Never add --force.

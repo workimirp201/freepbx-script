@@ -33,7 +33,7 @@ ETC = Path('/etc/freepbx-care')
 STATE = Path('/var/lib/freepbx-care')
 LOG = Path('/var/log/freepbx-care')
 SELF = Path('/root/freepbx-care.sh')
-VERSION = '2026.10.27-module-review-r6'
+VERSION = '2026.10.27-module-menu-r7'
 DEFAULT = dict(email='monitor@famecomputers.com', sender='', auto_restart=True,
                failures=3, cooldown=1800, max_restarts_hour=2, boot_grace=300,
                resume_grace=180, defer_active_calls=True, ami={},
@@ -53,6 +53,12 @@ OPTIONAL_MODULES = {
     'fax': 'Fax support - verify no inbound/outbound fax workflows use it.',
     'xmpp': 'Chat/messaging integration - verify no users/integrations use it.',
     'recording_report': 'Call recording reports - verify no users use this reporting interface.',
+}
+MODULE_LABELS = {
+    'sangomacrm': 'Sangoma CRM', 'zulu': 'Zulu softphones',
+    'sangomaconnect': 'Sangoma Connect softphones', 'sangomartapi': 'Sangoma real-time API',
+    'restapps': 'Phone Apps', 'ucp': 'User Control Panel', 'faxpro': 'Advanced Fax',
+    'fax': 'Fax support', 'xmpp': 'Chat / messaging', 'recording_report': 'Call Recording Reports',
 }
 
 
@@ -758,20 +764,46 @@ def apply_module_disable(name, expected):
 
 
 def module_review():
-    inventory = show_module_audit()
-    print('\nOne module at a time. Have a current PBX backup and an approved maintenance window.')
-    name = ask('Unused optional module to disable (Enter = audit only)')
-    if not name:
+    inventory = module_inventory()
+    choices = [name for name in OPTIONAL_MODULES if inventory.get(name, {}).get('status') == 'Enabled']
+    print('\nOptional features - choose one to review. Core/security modules are protected.')
+    disabled = [MODULE_LABELS[name] for name in OPTIONAL_MODULES
+                if inventory.get(name, {}).get('status') == 'Disabled']
+    if disabled:
+        print('Already disabled: ' + ', '.join(disabled))
+    if not choices:
+        print('No enabled optional features available to disable. No changes made.')
         return
-    if name not in OPTIONAL_MODULES or name not in inventory or inventory[name]['status'] != 'Enabled':
-        raise ValueError('Select an installed, Enabled optional module from the reviewed list')
-    print(f'Proposed: disable {name}, then reload FreePBX configuration. Impact: {OPTIONAL_MODULES[name]}')
-    print('No dependency bypass, module deletion or Asterisk restart will be requested.')
-    if ask(f'Type DISABLE {name} to confirm this feature is unused and apply', '') != f'DISABLE {name}':
-        print('Cancelled; no module changes made.')
-        return
-    with operation_lock():
-        apply_module_disable(name, inventory[name])
+    print('Only CRM is confirmed unused for this fleet; verify other features with the site.')
+    while True:
+        for index, name in enumerate(choices, 1):
+            hint = ' - confirmed unused in this fleet' if name == 'sangomacrm' else ''
+            print(f'  {index}. {MODULE_LABELS[name]}{hint}')
+        print('  A. View full module audit\n  0. Back without changes')
+        choice = ask('Choose a feature number', '0').lower()
+        if choice in ['', '0']:
+            return
+        if choice == 'a':
+            show_module_audit(inventory)
+            continue
+        if not choice.isascii() or not choice.isdigit() or not 1 <= int(choice) <= len(choices):
+            print('Enter a number shown above, A for the full audit, or 0 to go back.')
+            continue
+        name = choices[int(choice) - 1]
+        print(f'\nSelected: {MODULE_LABELS[name]} ({name})')
+        print('Feature impact:', OPTIONAL_MODULES[name])
+        print('This disables the selected module and reloads FreePBX configuration.')
+        print('Have a current PBX backup and an approved maintenance window. Dependency/call/health checks still apply.')
+        while True:
+            answer = ask('Disable this unused feature and reload configuration? y/n', 'n').lower()
+            if answer in ['', 'n', 'no']:
+                print('Cancelled; no module changes made.')
+                return
+            if answer in ['y', 'yes']:
+                with operation_lock():
+                    apply_module_disable(name, inventory[name])
+                return
+            print('Answer y or n. Enter keeps the feature enabled.')
 
 
 def crash_audit():

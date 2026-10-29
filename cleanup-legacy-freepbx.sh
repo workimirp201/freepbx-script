@@ -12,6 +12,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import shutil
 import stat
 import subprocess
@@ -154,7 +155,11 @@ def lock_holders(fd):
                     continue
             if matches:
                 args = [a.decode(errors='replace') for a in (proc / 'cmdline').read_bytes().split(b'\0') if a]
-                holders.append(dict(pid=int(proc.name), command=(proc / 'comm').read_text().strip(), args=args))
+                status = dict(line.split(':', 1) for line in (proc / 'status').read_text().splitlines() if ':' in line)
+                holders.append(dict(pid=int(proc.name), command=(proc / 'comm').read_text().strip(), args=args,
+                    ppid=int(status['PPid']), uids=[int(v) for v in status['Uid'].split()],
+                    exe=os.readlink(proc / 'exe'),
+                    start_ticks=(proc / 'stat').read_text().rsplit(')', 1)[1].split()[19]))
         except (FileNotFoundError, ProcessLookupError):
             continue
         except PermissionError:
@@ -162,9 +167,49 @@ def lock_holders(fd):
     return holders
 
 
-def validate_inherited_holders(holders):
+PM2_JLIST = '/var/www/html/admin/modules/pm2/node/node_modules/pm2/bin/pm2'
+PM2_WRAPPER = ('cd /var/www/html/admin/modules/pm2/node && mkdir -p /home/asterisk/.pm2 && '
+    'mkdir -p /var/www/html/admin/modules/pm2/node/logs && export HOME=/home/asterisk && '
+    'export PM2_HOME=/home/asterisk/.pm2 && export ASTLOGDIR=/var/log/asterisk && '
+    'export ASTVARLIBDIR=/var/lib/asterisk && export PATH=$HOME/.node/bin:$PATH && '
+    'export NODE_PATH=$HOME/.node/lib/node_modules:$NODE_PATH && export MANPATH=$HOME/.node/share/man:$MANPATH && '
+    + PM2_JLIST + ' jlist')
+
+
+def verified_pm2_jlist_holders(holders):
+    """Accept only the observed orphan wrapper + exact Node jlist child pair.
+
+    These processes are left running; this does not manage or signal PM2.
+    """
+    uid = int(run(['id', '-u', 'asterisk']).stdout.strip())
+    if uid == 0: raise RuntimeError('Refusing root asterisk account')
+    wrappers, nodes = [], []
+    for holder in holders:
+        args = holder['args']
+        wrapper = (holder['command'] == 'runuser' and holder.get('ppid') == 1 and
+            holder.get('uids') == [0, 0, 0, 0] and holder.get('exe') in ['/usr/sbin/runuser', '/usr/bin/runuser'] and
+            len(args) == 6 and args[0] in ['runuser', '/usr/sbin/runuser', '/usr/bin/runuser'] and
+            args[1:5] == ['asterisk', '-s', '/bin/bash', '-c'] and
+            shlex.split(args[5]) == shlex.split(PM2_WRAPPER))
+        node = (holder['command'] == 'node' and holder.get('exe') == '/usr/bin/node' and
+            holder.get('uids') == [uid, uid, uid, uid] and
+            args in [['node', PM2_JLIST, 'jlist'], ['/usr/bin/node', PM2_JLIST, 'jlist']])
+        if wrapper: wrappers.append(holder)
+        elif node: nodes.append(holder)
+        else: raise RuntimeError(f"Unrecognized PM2 lock holder PID {holder['pid']}; retirement refused")
+    if not wrappers or len(nodes) != len(wrappers):
+        raise RuntimeError('Complete PM2 jlist wrapper/child pairs required')
+    for wrapper in wrappers:
+        if sum(node.get('ppid') == wrapper['pid'] for node in nodes) != 1:
+            raise RuntimeError('PM2 jlist parent/child relationship not verified')
+    if any(node.get('ppid') not in {w['pid'] for w in wrappers} for node in nodes):
+        raise RuntimeError('Unpaired PM2 jlist child')
+
+
+def validate_inherited_holders(holders, allow_pm2=False):
     if not holders:
         raise RuntimeError('No identifiable Asterisk holders; inherited-lock retirement refused')
+    other = []
     for holder in holders:
         args = holder['args']
         command = holder['command']
@@ -173,10 +218,15 @@ def validate_inherited_holders(holders):
                         any(a.rsplit('/', 1)[-1] == 'safe_asterisk' for a in args[:2]))
         daemon = command == 'asterisk' and first == 'asterisk'
         if not (safe_wrapper or daemon):
-            raise RuntimeError(f"Lock also opened by PID {holder['pid']} ({command}); retirement refused")
+            other.append(holder)
+    if other:
+        if allow_pm2:
+            verified_pm2_jlist_holders(other)
+        else:
+            raise RuntimeError(f"Lock also opened by PID {other[0]['pid']} ({other[0]['command']}); retirement refused")
 
 
-def retire_inherited_lock(path, fd):
+def retire_inherited_lock(path, fd, allow_pm2=False):
     """Disable known legacy scheduling, then rename only a verified inherited lock.
 
     No process is signalled. Existing daemons keep their original open inode.
@@ -189,7 +239,7 @@ def retire_inherited_lock(path, fd):
     if active_controller_running():
         raise RuntimeError('A legacy monitor or fwconsole command is active; wait for it to finish')
     holders = lock_holders(fd)
-    validate_inherited_holders(holders)
+    validate_inherited_holders(holders, allow_pm2=allow_pm2)
     output = run(['asterisk', '-rx', 'core show uptime seconds']).stdout
     if not re.search(r'System uptime:\s*\d+', output):
         raise RuntimeError('Asterisk CLI readiness not established; inherited lock left untouched')
@@ -208,7 +258,10 @@ def retire_inherited_lock(path, fd):
             changed = True
         if active_controller_running():
             raise RuntimeError('A controller started during retirement; wait and retry')
-        validate_inherited_holders(lock_holders(fd))
+        current_holders = lock_holders(fd)
+        validate_inherited_holders(current_holders, allow_pm2=allow_pm2)
+        if allow_pm2 and sorted(holders, key=lambda h: h['pid']) != sorted(current_holders, key=lambda h: h['pid']):
+            raise RuntimeError('Lock holder identity changed during inspection; retirement refused')
         current = path.lstat()
         if (current.st_dev, current.st_ino) != (original.st_dev, original.st_ino):
             raise RuntimeError('Legacy lock path changed during inspection; retry')
@@ -226,7 +279,7 @@ def retire_inherited_lock(path, fd):
 
 
 @contextmanager
-def locks(retire_inherited=False):
+def locks(retire_inherited=False, retire_pm2=False):
     handles = []
     try:
         for name in ['/run/freepbx-care.lock', '/tmp/ast_mon.lock']:
@@ -237,7 +290,7 @@ def locks(retire_inherited=False):
                 fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
                 if retire_inherited and name == '/tmp/ast_mon.lock':
-                    retire_inherited_lock(Path(name), f.fileno())
+                    retire_inherited_lock(Path(name), f.fileno(), allow_pm2=retire_pm2)
                     handles.remove(f)
                     f.close()
                     fd = os.open(name, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
@@ -395,12 +448,14 @@ def main():
                    help='reset recognized old SMTP relay settings; defer SMTP delivery until new setup')
     p.add_argument('--retire-inherited-lock', action='store_true',
                    help='disable known legacy cron and retire a lock held only by healthy Asterisk daemons')
+    p.add_argument('--retire-pm2-jlist-lock', action='store_true',
+                   help='also permit exact verified orphan PM2 jlist wrapper/child holders; no processes are signalled')
     args = p.parse_args()
     if os.geteuid() != 0 or not Path('/etc/freepbx.conf').exists():
         raise RuntimeError('Run as root INSIDE the FreePBX container, not on the Proxmox host')
     os.umask(0o077)
     if args.apply:
-        with locks(args.retire_inherited_lock):
+        with locks(args.retire_inherited_lock or args.retire_pm2_jlist_lock, args.retire_pm2_jlist_lock):
             cleanup(True, args.remove_sender_rewrites, args.reset_smtp)
     else:
         cleanup(False, args.remove_sender_rewrites, args.reset_smtp)

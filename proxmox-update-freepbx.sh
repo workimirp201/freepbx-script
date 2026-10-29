@@ -16,10 +16,10 @@ import urllib.request
 
 if sys.argv[0] == '-c': sys.argv = sys.argv[1:]
 URL = 'https://raw.githubusercontent.com/workimirp201/freepbx-script/refs/heads/main/freepbx-care.sh'
-EXPECTED_SHA256 = 'd6ee5b20b9a35a16576e317e1af43a397b955f50e46b23340f61476c862157bf'
+EXPECTED_SHA256 = '4e79638140ad98efe3ec3e433e6fe6473806a631979ac92c2dbe87cbd2276a76'
 
 PAYLOAD = r'''
-import datetime, fcntl, hashlib, json, os, pathlib, shutil, sys, tempfile
+import datetime, fcntl, hashlib, json, os, pathlib, shutil, subprocess, sys, tempfile
 data = json.load(sys.stdin)
 source = data['script']
 raw = source.encode('utf-8')
@@ -31,13 +31,19 @@ os.umask(0o077)
 script = pathlib.Path('/root/freepbx-care.sh')
 settings = pathlib.Path('/etc/freepbx-care/config.json')
 service = pathlib.Path('/etc/systemd/system/freepbx-care.service')
-if script.is_symlink() or settings.is_symlink():
+timer = pathlib.Path('/etc/systemd/system/freepbx-care.timer')
+if any(path.is_symlink() for path in [script, settings, service, timer]):
     raise RuntimeError('Refusing symlink at an update path')
-if not script.is_file() or not settings.is_file() or not service.is_file():
-    print('FREEPBX_UPDATE_RESULT=' + json.dumps(dict(result='skipped', reason='No existing Care installation; use the installer')))
+if any(path.exists() and not path.is_file() for path in [script, settings, service, timer]):
+    raise RuntimeError('Refusing non-file at an update path')
+needs_install = not service.is_file() or not timer.is_file()
+if not script.is_file() or not settings.is_file() or (needs_install and not data.get('install_missing', False)):
+    print('FREEPBX_UPDATE_RESULT=' + json.dumps(dict(result='skipped', reason='Incomplete Care installation; --install-missing requires an existing script/config, otherwise use initial setup')))
     sys.exit(0)
-if 'ExecStart=/bin/bash /root/freepbx-care.sh check' not in service.read_text():
+if service.is_file() and 'ExecStart=/bin/bash /root/freepbx-care.sh check' not in service.read_text():
     raise RuntimeError('Unrecognized/custom monitoring service; review manually')
+if timer.is_file() and 'Unit=freepbx-care.service' not in timer.read_text():
+    raise RuntimeError('Unrecognized/custom monitoring timer; review manually')
 original = script.read_bytes()
 if b'def tick(c):' not in original or b'freepbx-care' not in original:
     raise RuntimeError('Unrecognized current script; review manually')
@@ -66,14 +72,18 @@ def update():
     validate()
     if script.read_bytes() != original:
         raise RuntimeError('Script changed during inspection; retry')
-    if original == raw:
+    if original == raw and not needs_install:
         return dict(result='current', version=namespace['VERSION'])
     if not data['apply']:
-        return dict(result='preview', version=namespace['VERSION'])
+        return dict(result='preview', version=namespace['VERSION'], install_missing_units=needs_install)
     backup = pathlib.Path('/var/lib/freepbx-care') / ('update-backup-' + datetime.datetime.now().strftime('%Y%m%d-%H%M%S-%f'))
     backup.mkdir(mode=0o700, parents=True)
     shutil.copy2(script, backup / 'freepbx-care.sh')
     shutil.copy2(settings, backup / 'config.json')
+    for unit in [service, timer]:
+        if unit.is_file(): shutil.copy2(unit, backup / unit.name)
+    (backup / 'manifest.json').write_text(json.dumps(dict(
+        install_missing_units=needs_install, service_existed=service.is_file(), timer_existed=timer.is_file()), indent=2))
     for file in backup.iterdir(): os.chmod(file, 0o600)
     mode = script.stat().st_mode & 0o777
     try:
@@ -83,7 +93,20 @@ def update():
     except Exception:
         atomic(script, original, mode)
         raise
-    return dict(result='updated', version=namespace['VERSION'], backup=str(backup))
+    if needs_install:
+        try:
+            # The updater already holds Care's operation lock. Run the loaded
+            # installer directly, preserving the existing saved configuration.
+            for directory in [settings.parent, backup.parent, pathlib.Path('/var/log/freepbx-care')]:
+                directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+                os.chmod(directory, 0o700)
+            namespace['install']()
+            subprocess.run(['systemctl', 'is-enabled', 'freepbx-care.timer'], check=True, timeout=15)
+            subprocess.run(['systemctl', 'is-active', 'freepbx-care.timer'], check=True, timeout=15)
+        except Exception:
+            print(f'Installation incomplete; inspect script/config/units and {backup}. No automatic installation rollback.')
+            raise
+    return dict(result='installed' if needs_install else 'updated', version=namespace['VERSION'], backup=str(backup))
 if data['apply']:
     fd = os.open('/run/freepbx-care.lock', os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
     with os.fdopen(fd, 'w') as lock:
@@ -112,7 +135,7 @@ def cluster_nodes(rows):
     return nodes
 
 
-def update_cluster(apply):
+def update_cluster(apply, install_missing=False, exclude=()):
     nodes = cluster_nodes(json.loads(run(['pvesh', 'get', '/cluster/status', '--output-format', 'json'])))
     source = Path(sys.argv[0]).read_text()
     failed = []
@@ -125,12 +148,17 @@ def update_cluster(apply):
             continue
         if node.get('local'):
             try:
-                rc = update_local([], True, apply)
+                options = {}
+                if install_missing: options['install_missing'] = True
+                if exclude: options['exclude'] = exclude
+                rc = update_local([], True, apply, **options)
             except (RuntimeError, ValueError, OSError, subprocess.TimeoutExpired) as e:
                 print(f'NODE {name}: {e}', flush=True)
                 rc = 1
         else:
             command = 'bash -s -- --all-running-freepbx' + (' --apply' if apply else '')
+            if install_missing: command += ' --install-missing'
+            for ctid in exclude: command += ' --exclude-ctid ' + ctid
             try:
                 # Execute this reviewed helper in memory; no peer host script/credentials are installed.
                 rc = subprocess.run(['ssh', '-T', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes',
@@ -144,11 +172,13 @@ def update_cluster(apply):
     return 1 if failed else 0
 
 
-def update_local(explicit, all_running, apply):
+def update_local(explicit, all_running, apply, install_missing=False, exclude=()):
     listing = run(['pct', 'list'], timeout=30)
     ctids = list(dict.fromkeys(explicit)) if not all_running else [
         row[0] for line in listing.splitlines()[1:] if len(row := line.split()) >= 2
         and row[0].isdigit() and row[1] == 'running']
+    ctids = [ctid for ctid in ctids if ctid not in set(exclude)]
+    if exclude: print('Explicitly excluded CTIDs:', ', '.join(exclude), flush=True)
     print('Mode:', 'APPLY' if apply else 'PREVIEW; add --apply to update', flush=True)
     with urllib.request.urlopen(URL, timeout=45) as response:
         raw = response.read(131073)
@@ -156,7 +186,7 @@ def update_local(explicit, all_running, apply):
         raise RuntimeError('Downloaded main script differs from the reviewed version; publish matching updater/main files')
     source = raw.decode('utf-8')
     run(['bash', '-n'], data=source)
-    totals = {key: [] for key in ['updated', 'current', 'preview', 'skipped', 'failed']}
+    totals = {key: [] for key in ['updated', 'installed', 'current', 'preview', 'skipped', 'failed']}
     for ctid in ctids:
         print(f'===== CT {ctid} =====', flush=True)
         try:
@@ -176,8 +206,8 @@ def update_local(explicit, all_running, apply):
             if re.search(r'(?m)^lock:', run(['pct', 'config', ctid], timeout=15)) or run(
                     ['pct', 'status', ctid], timeout=15) != 'status: running':
                 raise RuntimeError('Container stopped or became locked; retry later')
-            out = run(['pct', 'exec', ctid, '--', 'python3', '-c', PAYLOAD], timeout=120,
-                      data=json.dumps(dict(script=source, sha256=EXPECTED_SHA256, apply=apply)))
+            out = run(['pct', 'exec', ctid, '--', 'python3', '-c', PAYLOAD], timeout=420 if install_missing else 120,
+                      data=json.dumps(dict(script=source, sha256=EXPECTED_SHA256, apply=apply, install_missing=install_missing)))
             print(out, flush=True)
             markers = [line.split('=', 1)[1] for line in out.splitlines() if line.startswith('FREEPBX_UPDATE_RESULT=')]
             if len(markers) != 1:
@@ -190,8 +220,9 @@ def update_local(explicit, all_running, apply):
             print(f'FAILED CT {ctid}: {e}', flush=True)
             totals['failed'].append(ctid)
     print('Summary:', json.dumps(totals), flush=True)
-    print('Existing SMTP, local settings, pauses, timer state, extension groups and modules were not changed.')
-    print('This updates only the script at the existing service path; no installer, cleanup or test mail was run.')
+    print('Existing SMTP, pauses, recovery settings, extension groups and modules are preserved. No cleanup or test mail was run.')
+    print('Existing complete installations retain their timer state.')
+    print('Missing service/timer units may be installed and enabled only with --install-missing --apply.')
     print('Stopped containers were not selected in all-running mode; update them later when normally running.')
     return 1 if totals['failed'] else 0
 
@@ -202,13 +233,19 @@ def main():
     group.add_argument('--cluster', action='store_true', help='visit all online cluster nodes using existing trusted root SSH')
     group.add_argument('--all-running-freepbx', action='store_true', help='existing Care installations on this node')
     parser.add_argument('--apply', action='store_true')
+    parser.add_argument('--install-missing', action='store_true',
+                        help='also complete missing Care service/timer for an existing script/config, preserving saved settings')
+    parser.add_argument('--exclude-ctid', action='append', default=[], help='skip this numeric CTID; repeat to exclude more')
     parser.add_argument('ctids', nargs='*')
     args = parser.parse_args()
     if os.geteuid() != 0 or not shutil.which('pct'): parser.error('Run as root on a Proxmox host')
-    if any(not re.fullmatch(r'[0-9]+', ctid) for ctid in args.ctids): parser.error('CTIDs must be numeric')
+    if any(not re.fullmatch(r'[0-9]+', ctid) for ctid in args.ctids + args.exclude_ctid): parser.error('CTIDs must be numeric')
     if args.ctids and (args.cluster or args.all_running_freepbx): parser.error('Choose explicit CTIDs OR an all/cluster mode')
     if not args.ctids and not (args.cluster or args.all_running_freepbx): parser.error('Specify CTIDs, --all-running-freepbx or --cluster')
-    return update_cluster(args.apply) if args.cluster else update_local(args.ctids, args.all_running_freepbx, args.apply)
+    if args.cluster:
+        return update_cluster(args.apply, install_missing=args.install_missing, exclude=args.exclude_ctid)
+    return update_local(args.ctids, args.all_running_freepbx, args.apply,
+                        install_missing=args.install_missing, exclude=args.exclude_ctid)
 
 
 if __name__ == '__main__':

@@ -17,7 +17,7 @@ import urllib.request
 if sys.argv[0] == '-c': sys.argv = sys.argv[1:]
 URL = 'https://raw.githubusercontent.com/workimirp201/freepbx-script/refs/heads/main/freepbx-care.sh'
 # Refuse changed downloads until a new version has been reviewed.
-EXPECTED_SHA256 = 'b4ca70bd3983682cfcfa010c24c5b18b35848be5440fc4b03caf510103d667b5'
+EXPECTED_SHA256 = 'f25ad96323c0c53f8c63840f0d4b0525e8dac7dc2b928a6bd4754ee7e4bed1d2'
 PASSWORD = ''
 PREFLIGHT = r'''
 import sys

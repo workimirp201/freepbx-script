@@ -33,7 +33,8 @@ ETC = Path('/etc/freepbx-care')
 STATE = Path('/var/lib/freepbx-care')
 LOG = Path('/var/log/freepbx-care')
 SELF = Path('/root/freepbx-care.sh')
-VERSION = '2026.10.28-local-care-r8'
+VERSION = '2026.10.29-local-care-r8-exp1'
+EXPERIMENTAL_DEBIAN13 = False
 KNOWN_SECRETS = set()
 DEFAULT = dict(email='monitor@famecomputers.com', sender='', auto_restart=True,
                failures=3, cooldown=1800, max_restarts_hour=2, boot_grace=300,
@@ -135,6 +136,8 @@ def readjson(path, default):
 def config():
     c = copy.deepcopy(DEFAULT)
     c.update(readjson(ETC / 'config.json', {}))
+    if EXPERIMENTAL_DEBIAN13:
+        c['experimental_debian13'] = True
     c.pop('properties', None)  # Old property data is not enabled without technician review.
     validate(c)
     return c
@@ -145,6 +148,12 @@ def address(s):
 
 
 def validate(c):
+    if type(c.get('experimental_debian13', False)) is not bool:
+        raise ValueError('experimental_debian13 must be boolean')
+    if c.get('experimental_debian13', False):
+        # Enforce on every load/save, including edits through the normal menu.
+        c['auto_restart'] = False
+        c['auto_start_mariadb'] = False
     if not address(c['email']) or (c['sender'] and not address(c['sender'])):
         raise ValueError('Invalid notification email or sender')
     for key, low, high in [('failures', 2, 60), ('cooldown', 300, 86400),
@@ -913,7 +922,7 @@ def database_tick(c, st, h, statepath):
                '\nDatabase dependency unavailable; Asterisk recovery is deferred.')
     now = time.time()
     attempts = [t for t in st.get('database_starts', []) if now - t < 3600]
-    allowed = (c['auto_restart'] and c['auto_start_mariadb'] and database['startable'] and
+    allowed = (not c.get('experimental_debian13') and c['auto_restart'] and c['auto_start_mariadb'] and database['startable'] and
                not st.get('database_recovery_blocked') and not st.get('recovery_blocked') and
                now - st.get('last_database_start', 0) >= c['cooldown'] and
                len(attempts) < c['max_restarts_hour'])
@@ -983,6 +992,9 @@ def configure_services():
     for key, label in [('auto_start_mariadb', 'Automatically start stopped MariaDB? y/n'),
                        ('monitor_fastagi', 'Expect CRM FastAGI on 127.0.0.1:4573? y/n'),
                        ('database_query_check', 'Enable optional root socket SELECT 1 check? y/n')]:
+        if key == 'auto_start_mariadb' and c.get('experimental_debian13'):
+            print('MariaDB automatic start: blocked by experimental alert-only policy')
+            continue
         answer = ask(label, 'y' if c[key] else 'n').lower()
         if answer not in ['y', 'n']:
             raise ValueError('Answer y or n')
@@ -1154,6 +1166,8 @@ def apply_module_disable(name, expected, approval=None):
 
 
 def module_review():
+    if config().get('experimental_debian13'):
+        raise RuntimeError('Module changes are blocked in experimental Debian 13 alert-only mode')
     inventory = module_inventory()
     choices = [name for name in OPTIONAL_MODULES if inventory.get(name, {}).get('status') == 'Enabled']
     print('\nOptional features - choose one to review. Core/security modules are protected.')
@@ -1337,7 +1351,7 @@ def tick(c):
                 st['recovery_blocked'] = True
                 st['block_reason'] = 'Hourly Asterisk recovery limit reached'
                 transition(c, st, 'Asterisk recovery lock', 'outage', st['block_reason'])
-            allowed = (c['auto_restart'] and h['restartable'] and not st.get('recovery_blocked') and
+            allowed = (not c.get('experimental_debian13') and c['auto_restart'] and h['restartable'] and not st.get('recovery_blocked') and
                        now - st.get('last_restart', 0) >= c['cooldown'] and
                        len(history) < c['max_restarts_hour'])
             if allowed and c['defer_active_calls'] and h['cli']:
@@ -1413,7 +1427,10 @@ def configure():
     c = config()
     c['email'] = ask('Alert recipient', c['email'])
     c['sender'] = ask('Sender email (blank keeps system default)', c['sender'])
-    c['auto_restart'] = ask('Enable automatic recovery? y/n', 'y' if c['auto_restart'] else 'n').lower() == 'y'
+    if c.get('experimental_debian13'):
+        print('Automatic recovery: blocked by experimental alert-only policy')
+    else:
+        c['auto_restart'] = ask('Enable automatic recovery? y/n', 'y' if c['auto_restart'] else 'n').lower() == 'y'
     c['defer_active_calls'] = ask('Defer restart while CLI reports active channels? y/n',
                                   'y' if c['defer_active_calls'] else 'n').lower() == 'y'
     for key, label in [('failures', 'Consecutive failed checks'), ('cooldown', 'Restart cooldown seconds'),
@@ -1463,6 +1480,12 @@ def parse_os_release(text):
 
 def require_supported_platform():
     info = parse_os_release(Path('/etc/os-release').read_text())
+    if info.get('ID') == 'debian' and info.get('VERSION_ID') == '13' and config().get('experimental_debian13'):
+        for cmd in ['python3', 'fwconsole', 'asterisk', 'php', 'systemctl', 'crontab', 'pgrep']:
+            if not shutil.which(cmd):
+                raise RuntimeError(f'Experimental platform requirement missing: {cmd}')
+        print('WARNING: experimental Debian 13; alerts/diagnostics only. No automatic recovery or module changes.')
+        return info
     if info.get('ID') != 'debian' or info.get('VERSION_ID') != '12':
         raise RuntimeError('Requires Debian 12 for this FreePBX 17 installer; detected ' +
                            info.get('ID', 'unknown') + ' ' + info.get('VERSION_ID', 'unknown'))
@@ -1549,6 +1572,9 @@ def install():
         raise RuntimeError('Set up SMTP first (menu option 3), then install monitoring')
     check_legacy_cron()
     checked(['systemctl', 'stop', 'freepbx-care.timer']) if Path('/etc/systemd/system/freepbx-care.timer').exists() else None
+    if c.get('experimental_debian13'):
+        # Persist only after successful installation checks; all later checks enforce alert-only.
+        save(ETC / 'config.json', c)
     if Path(__file__).resolve() != SELF:
         atomic(SELF, Path(__file__).read_text(), 0o700)
     os.chmod(SELF, 0o700)
@@ -1604,6 +1630,8 @@ def smtp_profile(path):
 
 
 def smtp_setup(profile=None):
+    if config().get('experimental_debian13'):
+        raise RuntimeError('SMTP/package setup is blocked in experimental mode; existing SMTP is preserved')
     require_supported_platform()
     c = config()
     host = profile['host'] if profile else ask('SMTP relay DNS hostname (must match its certificate)')
@@ -1730,6 +1758,8 @@ def menu_action(choice):
 
 def menu():
     while True:
+        if config().get('experimental_debian13'):
+            print('EXPERIMENTAL DEBIAN 13: alert-only; automatic recovery, SMTP setup and module changes blocked')
         print(f'\nFreePBX Care {VERSION}\n1 Configure Asterisk monitor\n2 Install/update monitoring\n3 Configure SMTP relay\n4 Read-only health/status\n5 Send test email\n6 Pause monitoring\n7 Resume monitoring\n8 Disable monitoring\n9 Collect diagnostics (no restart)\n10 Configure extension monitoring\n11 Read-only extension status\n12 Configure MariaDB / CRM checks\n13 Review/disable unused optional modules\n14 Investigate crash/resource issues\n15 Configure SIP trunk alerts\n16 Read-only SIP trunk status\n17 Property/trunk maintenance exclusion\n18 Unlock recovery after review\n0 Exit')
         choice = ask('Choose', '0')
         if choice == '0':
@@ -1742,6 +1772,8 @@ def menu():
 
 def status():
     print('Version:', VERSION)
+    if config().get('experimental_debian13'):
+        print('Platform policy: EXPERIMENTAL DEBIAN 13 / ALERT-ONLY; recovery and module changes blocked')
     saved = readjson(STATE / 'state.json', {})
     print('Automatic recovery locks:', json.dumps(dict(
         asterisk=bool(saved.get('recovery_blocked') or saved.get('recovery_inflight')),
@@ -1811,8 +1843,14 @@ def main():
         'modules', 'module-audit', 'crash-audit', 'trunks', 'trunks-status', 'exclusions', 'recovery-unlock'])
     parser.add_argument('--minutes', type=int, default=60)
     parser.add_argument('--smtp-config', help='root-owned mode-600 SMTP profile JSON')
+    parser.add_argument('--experimental-debian13', action='store_true',
+                        help='explicit opt-in to Debian 13 alert-only installation; no package or OS changes')
     parser.add_argument('--version', action='version', version=VERSION)
     args = parser.parse_args()
+    global EXPERIMENTAL_DEBIAN13
+    EXPERIMENTAL_DEBIAN13 = args.experimental_debian13
+    if args.command == 'smtp' and config().get('experimental_debian13'):
+        parser.error('SMTP/package setup is blocked in experimental mode; preserve existing SMTP configuration')
     if os.geteuid() != 0:
         parser.error('Run as root: sudo bash freepbx-care.sh')
     os.umask(0o077)

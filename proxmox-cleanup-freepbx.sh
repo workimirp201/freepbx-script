@@ -407,6 +407,14 @@ def cleanup(apply=False, remove_rewrites=False, reset_smtp=False):
     rules = legacy_rewrites()
     reset = smtp_reset_plan() if reset_smtp else None
     remove_rewrites = remove_rewrites or bool(reset)
+    if remove_rewrites:
+        # Archive only maps whose exact contents AND active reference were
+        # recognized above. Unknown/custom maps remain for administrator review.
+        for reference in rules.values():
+            kind, name = reference.split(':', 1)
+            for filename in [name] + ([name + '.db'] if kind == 'hash' else []):
+                if regular(Path(filename)):
+                    archive.append(Path(filename))
     if reset:
         for name in ['/etc/postfix/sasl/sasl_passwd', '/etc/postfix/sasl/sasl_passwd.db']:
             if regular(Path(name)): archive.append(Path(name))
@@ -418,7 +426,7 @@ def cleanup(apply=False, remove_rewrites=False, reset_smtp=False):
     print('Files to archive:', ', '.join(map(str, archive)) or 'none')
     print('Previous FreePBX Care timer to disable:', disable_care)
     print('Recognized legacy sender rules:', ', '.join(rules) or 'none')
-    print('Sender rules:', 'detach recognized rules' if remove_rewrites else 'preserve (default)')
+    print('Sender rules:', 'detach/archive recognized rules' if remove_rewrites else 'preserve (default)')
     if reset:
         print('RESET SMTP: remove old relay/TLS/auth settings and archive its password files.')
         print('External smtp/relay deliveries will be deferred until the UPDATED SMTP setup completes.')

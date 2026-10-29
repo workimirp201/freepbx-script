@@ -2,7 +2,7 @@
 set -euo pipefail
 command -v python3 >/dev/null || { echo 'python3 is required'; exit 1; }
 exec python3 -c "$(cat <<'PYTHON'
-"""Opt existing Debian 13 FreePBX containers into experimental alert-only Care."""
+"""Opt existing Debian 13 FreePBX containers into experimental Care; recovery requires --enable-recovery."""
 import argparse
 import hashlib
 import json
@@ -16,7 +16,7 @@ import urllib.request
 
 if sys.argv[0] == '-c': sys.argv = sys.argv[1:]
 URL = 'https://raw.githubusercontent.com/workimirp201/freepbx-script/refs/heads/main/freepbx-care.sh'
-EXPECTED_SHA256 = 'f25ad96323c0c53f8c63840f0d4b0525e8dac7dc2b928a6bd4754ee7e4bed1d2'
+EXPECTED_SHA256 = 'd6ee5b20b9a35a16576e317e1af43a397b955f50e46b23340f61476c862157bf'
 
 PAYLOAD = r'''
 import datetime, hashlib, json, os, pathlib, shutil, subprocess, sys, tempfile
@@ -49,6 +49,10 @@ if info.get('ID') != 'debian' or info.get('VERSION_ID') != '13':
     print('EXPERIMENTAL_RESULT=skipped (not Debian 13)')
     sys.exit(0)
 ns['EXPERIMENTAL_DEBIAN13'] = True
+if type(data.get('enable_recovery', False)) is not bool:
+    raise RuntimeError('enable_recovery must be boolean')
+ns['EXPERIMENTAL_RECOVERY'] = data.get('enable_recovery', False)
+policy = 'recovery-opt-in' if ns['EXPERIMENTAL_RECOVERY'] else 'alert-only'
 def validate():
     if ns['fwconsole_busy'](): raise RuntimeError('fwconsole operation running; retry later')
     if pathlib.Path('/var/lib/freepbx-care/module-change-pending.json').exists():
@@ -96,10 +100,10 @@ def apply():
         if os.path.exists(stage): os.unlink(stage)
 if data['apply']:
     with ns['operation_lock'](): apply()
-    print('EXPERIMENTAL_RESULT=installed-alert-only')
+    print('EXPERIMENTAL_RESULT=installed-' + policy)
 else:
     validate()
-    print('EXPERIMENTAL_RESULT=preview-alert-only')
+    print('EXPERIMENTAL_RESULT=preview-' + policy)
 '''
 
 def run(args, **kwargs):
@@ -111,7 +115,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--experimental-debian13', action='store_true', required=True)
     parser.add_argument('--all-running-freepbx', action='store_true')
-    parser.add_argument('--apply', action='store_true', help='install and enable alert-only monitoring; preview is default')
+    parser.add_argument('--enable-recovery', action='store_true', help='explicitly enable normal Asterisk/MariaDB recovery safeguards and technician features')
+    parser.add_argument('--apply', action='store_true', help='install and enable monitoring under the selected policy; preview is default')
     parser.add_argument('ctids', nargs='*')
     args = parser.parse_args()
     if os.geteuid() != 0 or not shutil.which('pct'): parser.error('Run as root on a Proxmox host')
@@ -126,7 +131,8 @@ def main():
         raise RuntimeError('Download differs from reviewed version; publish matching main and helper')
     run(['bash', '-n'], input=raw.decode('utf-8'))
     failed = []
-    print('APPLY: enabling experimental alert-only timers' if args.apply else 'PREVIEW: no installation changes')
+    policy = 'RECOVERY OPT-IN' if args.enable_recovery else 'ALERT-ONLY'
+    print(('APPLY: enabling experimental timers / ' if args.apply else 'PREVIEW: no installation changes / ') + policy)
     for ctid in ctids:
         print('===== CT ' + ctid + ' =====', flush=True)
         try:
@@ -137,7 +143,8 @@ def main():
             probe = subprocess.run(['pct', 'exec', ctid, '--', 'test', '-f', '/etc/freepbx.conf'], timeout=15)
             if probe.returncode: print('SKIP: FreePBX not detected'); continue
             print(run(['pct', 'exec', ctid, '--', 'python3', '-c', PAYLOAD], timeout=420,
-                      input=json.dumps(dict(script=raw.decode('utf-8'), sha256=EXPECTED_SHA256, apply=args.apply))))
+                      input=json.dumps(dict(script=raw.decode('utf-8'), sha256=EXPECTED_SHA256,
+                                            apply=args.apply, enable_recovery=args.enable_recovery))))
         except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired) as e:
             print('FAILED CT ' + ctid + ': ' + str(e), flush=True)
             failed.append(ctid)

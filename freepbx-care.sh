@@ -33,17 +33,20 @@ ETC = Path('/etc/freepbx-care')
 STATE = Path('/var/lib/freepbx-care')
 LOG = Path('/var/log/freepbx-care')
 SELF = Path('/root/freepbx-care.sh')
-VERSION = '2026.10.27-module-menu-r7'
+VERSION = '2026.10.28-local-care-r8'
+KNOWN_SECRETS = set()
 DEFAULT = dict(email='monitor@famecomputers.com', sender='', auto_restart=True,
                failures=3, cooldown=1800, max_restarts_hour=2, boot_grace=300,
                resume_grace=180, defer_active_calls=True, ami={},
                extension_monitor=dict(enabled=False, failures=3, groups=[]),
-               auto_start_mariadb=True, monitor_fastagi=False)
+               auto_start_mariadb=True, monitor_fastagi=False,
+               database_query_check=False,
+               trunk_monitor=dict(enabled=False, failures=3, recovery_checks=2, trunks=[]))
 
 # Only these optional features can be changed through this helper. Absence of
 # activity does NOT prove a module is unused. Everything else remains audit-only.
 OPTIONAL_MODULES = {
-    'sangomacrm': 'CRM integration - confirmed unused for this fleet; still check site exceptions.',
+    'sangomacrm': 'CRM integration - disable only when this site confirms it is unused.',
     'zulu': 'Zulu desktop/mobile client - verify no users or integrations use it.',
     'sangomaconnect': 'Sangoma Connect softphones - verify no users use this service.',
     'sangomartapi': 'Sangoma real-time API - verify no connected clients/integrations need it.',
@@ -153,6 +156,9 @@ def validate(c):
         if type(c[key]) is not bool:
             raise ValueError(f'{key} must be boolean')
     validate_extensions(c['extension_monitor'])
+    validate_trunks(c['trunk_monitor'])
+    if type(c['database_query_check']) is not bool:
+        raise ValueError('database_query_check must be boolean')
 
 
 def validate_extensions(settings):
@@ -163,6 +169,8 @@ def validate_extensions(settings):
     groups = settings.get('groups')
     if not isinstance(groups, list) or len(groups) > 100 or (settings['enabled'] and not groups):
         raise ValueError('Enabled extension monitoring needs 1..100 groups')
+    if type(settings.get('recovery_checks', 1)) is not int or not 1 <= settings.get('recovery_checks', 1) <= 60:
+        raise ValueError('Extension recovery checks must be 1..60')
     names = set()
     for group in groups:
         if not isinstance(group, dict):
@@ -181,16 +189,347 @@ def validate_extensions(settings):
             raise ValueError('Extension alert mode must be all or any')
 
 
+def valid_note(value):
+    return isinstance(value, str) and 1 <= len(value.strip()) <= 200 and not any(ord(c) < 32 or ord(c) == 127 for c in value)
+
+
+def redact(value):
+    """Best effort secret removal; diagnostic files still require private handling."""
+    text = str(value)
+    secrets = list(KNOWN_SECRETS)
+    try:
+        settings = readjson(ETC / 'config.json', {})
+        secrets.append(settings.get('ami', {}).get('secret', ''))
+        for path in [Path('/etc/postfix/freepbx-care-sasl'), Path('/etc/postfix/sasl/sasl_passwd')]:
+            if path.is_file() and not path.is_symlink() and path.stat().st_size <= 65536:
+                for line in path.read_text().splitlines():
+                    parts = line.split(None, 1)
+                    if len(parts) == 2 and ':' in parts[1]:
+                        secrets.append(parts[1].split(':', 1)[1])
+    except (OSError, ValueError, AttributeError):
+        pass
+    for secret in sorted({v for v in secrets if isinstance(v, str) and v}, key=len, reverse=True):
+        if secret:
+            text = (text.replace(secret, '[REDACTED]') if len(secret) >= 4 else
+                    re.sub(r'(?<!\w)' + re.escape(secret) + r'(?!\w)', '[REDACTED]', text))
+    text = re.sub(r'(?im)(\b(?:secret|password|passwd|authorization|proxy-authorization)["\x27]?\s*[=:]\s*)[^\r\n,}]+',
+                  r'\1[REDACTED]', text)
+    text = re.sub(r'(?i)([a-z][a-z0-9+.-]*://)[^\s/@]+:[^\s/@]+@', r'\1[REDACTED]@', text)
+    text = re.sub(r'(?i)(--password(?:=|\s+)|\bidentified by\s+)[^\s]+', r'\1[REDACTED]', text)
+    return text
+
+
+def diagnostic_write(path, text):
+    atomic(path, redact(text)[:524288] + '\n[Diagnostic output bounded to 512 KiB]\n')
+
+
+def recovery_notices(c, st):
+    """Keep one deduplicated, retryable result for each local recovery type."""
+    for key, label, health_key in [('last_restart_result', 'Asterisk recovery', 'health'),
+                                    ('last_database_start_result', 'MariaDB start', 'database')]:
+        result = st.get(key)
+        if result:
+            outcome = 'verified' if result['exit'] == 0 and result[health_key]['healthy'] else 'failed'
+            token = str(result['time']) + ' ' + outcome
+            transition(c, st, label, token, json.dumps(result, indent=2))
+
+
+def idle_channels():
+    rc, out, _ = cli('core show channels count')
+    m = re.search(r'(?m)^\s*(\d+) active channels?\b', out)
+    return rc == 0 and m is not None and int(m[1]) == 0
+
+
+def observe_asterisk_restarts(c, st, h, now):
+    uptime = h.get('asterisk_uptime')
+    if uptime is None:
+        return
+    previous = st.get('observed_asterisk_uptime')
+    events = [t for t in st.get('observed_asterisk_restarts', []) if 0 <= now - t < 3600]
+    if previous is not None and uptime + 5 < previous:
+        events.append(now)
+        log('Asterisk uptime decreased outside a recorded Care recovery; review crash/restart history')
+    st.update(observed_asterisk_uptime=uptime, observed_asterisk_restarts=events[-20:])
+    if len(events) >= c['max_restarts_hour']:
+        st['recovery_blocked'] = True
+        st['block_reason'] = 'Repeated observed Asterisk restarts; crash-loop review required'
+        transition(c, st, 'Asterisk recovery lock', 'outage', st['block_reason'])
+
+
+def database_query_health(database):
+    """Optional root socket SELECT only; no application credentials or repairs."""
+    client = shutil.which('mariadb')
+    if not client:
+        return dict(database, healthy=False, state='query_probe_unavailable', startable=False)
+    rc, out, _ = run([client, '--protocol=socket', '--connect-timeout=3', '--batch',
+                      '--skip-column-names', '--execute', 'SELECT 1'], 5)
+    return dict(database, healthy=rc == 0 and out.strip() == '1',
+                state='healthy' if rc == 0 and out.strip() == '1' else 'query_failed', startable=False)
+
+
+def verify_database(c):
+    result = dict(healthy=False, state='unknown', startable=False)
+    for attempt in range(3):
+        result = database_health()
+        if result['healthy'] and c.get('database_query_check'):
+            result = database_query_health(result)
+        if result['healthy']:
+            return result
+        if attempt < 2:
+            time.sleep(2)
+    return result
+
+
+def verify_recovery(c):
+    """Two consecutive good probes within three attempts; no recovery commands."""
+    consecutive = 0
+    for attempt in range(3):
+        result = health(c)
+        consecutive = consecutive + 1 if result['healthy'] else 0
+        if consecutive >= 2:
+            return result
+        if attempt < 2:
+            time.sleep(2)
+    return dict(result, healthy=False, verification='Two consecutive healthy probes did not pass')
+
+
+def recovery_unlock():
+    c = config()
+    if fwconsole_busy() or (STATE / 'module-change-pending.json').exists():
+        raise RuntimeError('Finish and review pending fwconsole/module work before unlocking recovery')
+    h = health(c)
+    if not h['healthy']:
+        raise RuntimeError('Restore database/CLI/AMI health before unlocking automatic recovery')
+    st = readjson(STATE / 'state.json', {})
+    reviewed = {k: st.get(k) for k in ['block_reason', 'database_block_reason',
+                 'last_restart_result', 'last_database_start_result']}
+    st.update(recovery_blocked=False, database_recovery_blocked=False, failures=0,
+              database_failures=0, settle_until=time.time() + c['resume_grace'])
+    for key in ['recovery_inflight', 'database_recovery_inflight', 'block_reason', 'database_block_reason']:
+        st.pop(key, None)
+    # Attempt timestamps remain intact: unlock cannot bypass cooldown/hourly limits.
+    save(STATE / 'state.json', st)
+    diagnostic_write(LOG / 'last-recovery-unlock.log', json.dumps(dict(
+        time=time.time(), user=os.environ.get('SUDO_USER') or os.environ.get('USER', 'root'), reviewed=reviewed)))
+    print('Recovery unlocked after healthy review. Cooldowns, attempt history and pauses remain in force.')
+
+
+def validate_trunks(settings):
+    if not isinstance(settings, dict) or type(settings.get('enabled')) is not bool:
+        raise ValueError('Invalid trunk settings')
+    for key in ['failures', 'recovery_checks']:
+        if type(settings.get(key)) is not int or not 2 <= settings[key] <= 60:
+            raise ValueError('Trunk debounce values must be 2..60')
+    trunks = settings.get('trunks')
+    if not isinstance(trunks, list) or len(trunks) > 100 or (settings['enabled'] and not trunks):
+        raise ValueError('Enabled trunk monitoring needs 1..100 definitions')
+    names = set()
+    for item in trunks:
+        if not isinstance(item, dict) or not valid_note(item.get('name')) or item['name'].casefold() in names:
+            raise ValueError('Use unique trunk names')
+        names.add(item['name'].casefold())
+        ids = item.get('aors', [])
+        registration = item.get('registration', '')
+        if (not isinstance(ids, list) or len(ids) > 20 or any(not isinstance(v, str) for v in ids) or
+                len(set(ids)) != len(ids) or
+                not isinstance(registration, str) or (not ids and not registration)):
+            raise ValueError('Trunk requires availability AORs and/or an outbound registration ID')
+        for value in ids + ([registration] if registration else []):
+            if not isinstance(value, str) or not re.fullmatch(r'[A-Za-z0-9_.@+-]{1,100}', value):
+                raise ValueError('Use exact PJSIP object IDs (letters, digits, dot, @, +, _, -)')
+
+
+def parse_registrations(text):
+    """Native PJSIP table, exact IDs and complete footer; unknown formats fail closed."""
+    text = re.sub(r'\x1b\[[0-9;]*m', '', text)
+    rows = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith(('<', '=', 'Objects found:', 'No objects found.')):
+            continue
+        m = re.fullmatch(r'([^\s/]+)/sips?:\S+\s+\S+\s+(Registered|Unregistered|Rejected)(?:\s+.*)?', line)
+        if not m or m[1] in rows:
+            raise RuntimeError('Unsupported or ambiguous outbound registration output')
+        rows[m[1]] = m[2]
+    footer = re.search(r'(?m)^\s*Objects found:\s*(\d+)\s*$', text)
+    if not ((footer and int(footer[1]) == len(rows)) or (not rows and text.strip() == 'No objects found.')):
+        raise RuntimeError('Incomplete outbound registration inventory')
+    return rows
+
+
+def trunk_report(c):
+    settings = c['trunk_monitor']
+    if not settings['enabled']:
+        return dict(enabled=False, trunks=[])
+    results = []
+    try:
+        availability = {}
+        definitions = [dict(name=t['name'], extensions=t.get('aors', []), mode='all')
+                       for t in settings['trunks'] if t.get('aors')]
+        if definitions:
+            probe = dict(c, extension_monitor=dict(enabled=True, failures=3, groups=definitions))
+            report = extension_report(probe)
+            if report.get('error'):
+                raise RuntimeError(report['error'])
+            availability = {g['name']: g['status'] for g in report['groups']}
+        registrations = {}
+        if any(t.get('registration') for t in settings['trunks']):
+            rc, out, _ = cli('pjsip show registrations')
+            if rc:
+                raise RuntimeError('Outbound registration query failed')
+            registrations = parse_registrations(out)
+        for definition in settings['trunks']:
+            states = []
+            if definition.get('aors'):
+                states.append(availability[definition['name']])
+            reg = definition.get('registration', '')
+            value = registrations.get(reg) if reg else None
+            if reg:
+                states.append('healthy' if value == 'Registered' else 'outage'
+                              if value in ['Rejected', 'Unregistered'] else 'unknown')
+            status = 'unknown' if 'unknown' in states else 'outage' if 'outage' in states else 'healthy'
+            results.append(dict(name=definition['name'], status=status,
+                                availability=availability.get(definition['name']), registration=value))
+        return dict(enabled=True, trunks=results)
+    except (RuntimeError, ValueError, OSError) as e:
+        return dict(enabled=True, trunks=[], error=str(e))
+
+
+def excluded_names(kind):
+    st = readjson(STATE / 'exclusions.json', {})
+    return {name for name, until in st.get(kind, {}).items() if until > time.time()}
+
+
+def reset_trunk_debounce(c):
+    if c['trunk_monitor']['enabled']:
+        st = readjson(STATE / 'trunks.json', {})
+        for entry in st.get('trunks', {}).values():
+            entry.update(collection_failures=0, collection_successes=0,
+                         availability_failures=0, availability_successes=0)
+        save(STATE / 'trunks.json', st)
+
+
+def trunks_tick(c, pbx_healthy):
+    settings = c['trunk_monitor']
+    if not settings['enabled']:
+        return
+    if not pbx_healthy:
+        reset_trunk_debounce(c)
+        return
+    st = readjson(STATE / 'trunks.json', {})
+    entries = st.setdefault('trunks', {})
+    now = time.time()
+    gap = now - st.get('last_observed', now) > 300
+    report = trunk_report(c)
+    st.update(last_observed=now, last_report=report)
+    excluded = excluded_names('trunks')
+    definitions = {t['name']: t for t in settings['trunks']}
+    by_name = {r['name']: r for r in report['trunks']}
+    remaining = 5
+    for name, definition in definitions.items():
+        signature = json.dumps(definition, sort_keys=True)
+        entry = entries.setdefault(name, {})
+        if entry.get('definition') != signature:
+            entry = entries[name] = dict(definition=signature)
+        if gap or name in excluded:
+            entry.update(collection_failures=0, collection_successes=0,
+                         availability_failures=0, availability_successes=0)
+        if name in excluded:
+            entry['status'] = 'maintenance'
+            continue
+        result = by_name.get(name, dict(name=name, status='unknown', error=report.get('error')))
+        status = result['status']
+        # Unknown is a collection incident, never a false trunk recovery.
+        entry['status'] = status
+        for key, bad in [('collection', status == 'unknown'), ('availability', status == 'outage')]:
+            if key == 'availability' and status == 'unknown':
+                entry.update(availability_failures=0, availability_successes=0)
+                continue
+            counter = key + '_failures'
+            successes = key + '_successes'
+            entry[counter] = entry.get(counter, 0) + 1 if bad else 0
+            entry[successes] = 0 if bad else entry.get(successes, 0) + 1
+            if gap:
+                entry[counter] = int(bad)
+                entry[successes] = int(not bad)
+            desired = 'outage' if bad else 'healthy'
+            threshold = settings['failures'] if bad else settings['recovery_checks']
+            if (entry[counter] if bad else entry[successes]) >= threshold and remaining:
+                label = 'Trunk ' + name + (' collection' if key == 'collection' else '')
+                previous = entry.get('notified', {}).get(label)
+                transition(c, entry, label, desired, json.dumps(result) +
+                           '\nAlert only: no restart, reload or registration command was requested.')
+                if previous != desired and not (previous is None and desired == 'healthy'):
+                    remaining -= 1
+    st['trunks'] = {name: entry for name, entry in entries.items() if name in definitions}
+    save(STATE / 'trunks.json', st)
+
+
+def configure_trunks():
+    c = config()
+    settings = copy.deepcopy(c['trunk_monitor'])
+    if ask('Enable optional PJSIP trunk alerts? y/n', 'n').lower() not in ['y', 'yes']:
+        settings['enabled'] = False
+    else:
+        print('Read IDs with pjsip list aors and pjsip show registrations. IP-auth trunks normally have no registration.')
+        settings = dict(enabled=True, failures=int(ask('Consecutive failed checks', '3')),
+                        recovery_checks=int(ask('Consecutive healthy checks for recovery', '2')), trunks=[])
+        count = int(ask('Number of trunks', '1'))
+        if not 1 <= count <= 100:
+            raise ValueError('Choose 1..100 trunks')
+        for _ in range(count):
+            settings['trunks'].append(dict(name=ask('Trunk display name'),
+                aors=ask('Exact AOR IDs for availability, comma/space separated; blank skips').replace(',', ' ').split(),
+                registration=ask('Exact outbound registration ID; blank for IP-auth/no registration')))
+    validate_trunks(settings)
+    candidate = dict(c, trunk_monitor=settings)
+    report = trunk_report(candidate)
+    print(json.dumps(report, indent=2))
+    if report.get('error') or any(t['status'] == 'unknown' for t in report['trunks']):
+        raise RuntimeError('Cannot validate trunk IDs/states; settings were not saved')
+    if ask('Save these trunk settings? y/n', 'n').lower() in ['y', 'yes']:
+        save(ETC / 'config.json', candidate)
+        reset_trunk_debounce(candidate)
+        print('Trunk settings saved. Alerts only; qualify/registration do not prove calls work.')
+
+
+def configure_exclusion():
+    c = config()
+    kind = ask('Maintenance target: 1 property/extensions, 2 trunk', '1')
+    if kind not in ['1', '2']:
+        raise ValueError('Choose 1 or 2')
+    kind = 'extensions' if kind == '1' else 'trunks'
+    definitions = c['extension_monitor']['groups'] if kind == 'extensions' else c['trunk_monitor']['trunks']
+    if not definitions:
+        print('No configured targets.')
+        return
+    for index, item in enumerate(definitions, 1):
+        print(f'{index}. {item["name"]}')
+    index = int(ask('Target number'))
+    minutes = int(ask('Exclude minutes; 0 ends this exclusion', '60'))
+    if not 1 <= index <= len(definitions) or not 0 <= minutes <= 10080:
+        raise ValueError('Invalid target or duration (0..10080 minutes)')
+    name = definitions[index - 1]['name']
+    st = readjson(STATE / 'exclusions.json', {})
+    st.setdefault(kind, {})[name] = time.time() + minutes * 60
+    save(STATE / 'exclusions.json', st)
+    if kind == 'extensions':
+        reset_extension_debounce(c)
+    else:
+        reset_trunk_debounce(c)
+    print(f'{name}: exclusion saved. Core Asterisk/MariaDB checks and other properties remain active.')
+
+
 def log(message):
-    print(f'{datetime.datetime.now().astimezone().isoformat()} {message}', flush=True)
+    print(f'{datetime.datetime.now().astimezone().isoformat()} {redact(message)}', flush=True)
 
 
 def notify(c, subject, body):
     msg = email.message.EmailMessage()
     msg['To'] = c['email']
     msg['From'] = c['sender'] or ('root@' + socket.getfqdn())
-    msg['Subject'] = f'FreePBX {socket.gethostname()}: {subject}'
-    msg.set_content(body)
+    msg['Subject'] = f'FreePBX {socket.gethostname()}: {redact(subject)}'
+    msg.set_content(redact(body))
     try:
         rc, _, _ = run(['/usr/sbin/sendmail', '-oi', '-f', str(msg['From']), '--', c['email']],
                        data=msg.as_string())
@@ -209,8 +548,17 @@ def transition(c, state, key, status, body):
         state['notified'][key] = status
     elif previous != status:
         log(f'{key}: {status}; {body}')
+        retries = state.setdefault('notification_retry', {})
+        retry = retries.get(key, {})
+        if retry.get('status') == status and retry.get('after', 0) > time.time():
+            return
         if notify(c, f'{key}: {status}', body):
             state['notified'][key] = status
+            retries.pop(key, None)
+        else:
+            failures = min(retry.get('failures', 0) + 1, 6) if retry.get('status') == status else 1
+            retries[key] = dict(status=status, failures=failures,
+                                after=time.time() + min(900, 30 * 2 ** failures))
 
 
 def cli(command):
@@ -289,7 +637,9 @@ def reset_extension_debounce(c):
         st = readjson(path, {})
         for value in st.get('groups', {}).values():
             value['failures'] = 0
+            value['successes'] = 0
         st['collection_failures'] = 0
+        st['collection_successes'] = 0
         save(path, st)
     except (ValueError, OSError) as e:
         log(f'Cannot reset extension debounce state: {e}; administrator review needed')
@@ -304,14 +654,21 @@ def extensions_tick(c, pbx_healthy):
         log('Extension checks deferred: PBX health checks have not passed')
         return
     report = extension_report(c)
+    excluded = excluded_names('extensions')
+    report['groups'] = [g for g in report['groups'] if g['name'] not in excluded]
     path = STATE / 'extensions.json'
     st = readjson(path, {})
     now = time.time()
     groups = st.setdefault('groups', {})
+    for name in excluded:
+        if name in groups:
+            groups[name].update(failures=0, successes=0)
     if now - st.get('last_observed', now) > 300:
         st['collection_failures'] = 0
+        st['collection_successes'] = 0
         for value in groups.values():
             value['failures'] = 0
+            value['successes'] = 0
     st.update(last_observed=now, last_report=report)
     # Bound local sendmail wait time when many properties change at once.
     # Unsent transitions stay pending for subsequent checks.
@@ -325,9 +682,14 @@ def extensions_tick(c, pbx_healthy):
                 return
             remaining -= 1
         transition(c, target, key, status, body)
+    if all(g['name'] in excluded for g in c['extension_monitor']['groups']):
+        st.update(collection_failures=0, collection_successes=0)
+        save(path, st)
+        return
     unknown = report.get('error') or any(g['status'] == 'unknown' or
         'unknown' in g['extensions'].values() for g in report['groups'])
     if unknown:
+        st['collection_successes'] = 0
         st['collection_failures'] = st.get('collection_failures', 0) + 1
         if st['collection_failures'] >= c['extension_monitor']['failures']:
             announce(st, 'Extension collection', 'outage',
@@ -335,14 +697,19 @@ def extensions_tick(c, pbx_healthy):
                        json.dumps(report, indent=2))
     else:
         st['collection_failures'] = 0
-        announce(st, 'Extension collection', 'healthy', 'PJSIP extension state collection restored.')
+        st['collection_successes'] = st.get('collection_successes', 0) + 1
+        if st['collection_successes'] >= c['extension_monitor'].get('recovery_checks', 1):
+            announce(st, 'Extension collection', 'healthy', 'PJSIP extension state collection restored.')
     if report.get('error'):
         for value in groups.values():
             value['failures'] = 0
+            value['successes'] = 0
         log('Extension collection unavailable: ' + report['error'])
     else:
-        active = set()
-        for definition, result in zip(c['extension_monitor']['groups'], report['groups']):
+        active = set(excluded)
+        definitions = {g['name']: g for g in c['extension_monitor']['groups']}
+        for result in report['groups']:
+            definition = definitions[result['name']]
             name = definition['name']
             active.add(name)
             signature = json.dumps(definition, sort_keys=True)
@@ -351,12 +718,14 @@ def extensions_tick(c, pbx_healthy):
                 entry = groups[name] = dict(definition=signature)
             entry['last_status'] = result['status']
             if result['status'] == 'outage':
+                entry['successes'] = 0
                 entry['failures'] = entry.get('failures', 0) + 1
                 if entry['failures'] >= c['extension_monitor']['failures']:
                     announce(entry, name, 'outage', json.dumps(result, indent=2))
             else:
                 entry['failures'] = 0
-                if result['status'] == 'healthy':
+                entry['successes'] = entry.get('successes', 0) + 1 if result['status'] == 'healthy' else 0
+                if result['status'] == 'healthy' and entry['successes'] >= c['extension_monitor'].get('recovery_checks', 1):
                     meaning = ('At least one monitored extension is available again.' if definition['mode'] == 'all'
                                else 'All monitored extensions are available again.')
                     announce(entry, name, 'healthy', meaning + '\n' + json.dumps(result, indent=2))
@@ -378,6 +747,7 @@ def configure_extensions():
     else:
         settings['enabled'] = True
         settings['failures'] = int(ask('Extension consecutive failed checks', str(settings['failures'])))
+        settings['recovery_checks'] = int(ask('Extension consecutive healthy checks', str(settings.get('recovery_checks', 2))))
         edit = ask('Replace property/extension groups? y/n', 'n' if settings['groups'] else 'y').lower()
         if edit not in ['y', 'n']:
             raise ValueError('Answer y or n')
@@ -447,6 +817,7 @@ def ami_credentials(c):
 def ami_probe(c):
     try:
         a = ami_credentials(c)
+        KNOWN_SECRETS.add(a.get('secret', ''))
     except (ValueError, OSError):
         return 'config_error'
     try:
@@ -515,12 +886,17 @@ def database_health():
 
 def health(c):
     database = database_health()
+    if database['healthy'] and c.get('database_query_check'):
+        database = database_query_health(database)
     rc, out, _ = cli('core show uptime seconds')
     cli_ok = rc == 0 and bool(re.search(r'System uptime:\s*\d+', out))
+    shutting_down = bool(re.search(r'during shutdown|shutting down', out, re.I))
+    uptime = re.search(r'System uptime:\s*(\d+)', out)
     ami = ami_probe(c) if database['healthy'] else 'database_unavailable'
-    return dict(cli=cli_ok, ami=ami, database=database,
+    return dict(cli=cli_ok, ami=ami, database=database, shutting_down=shutting_down,
+                asterisk_uptime=int(uptime[1]) if uptime else None,
                 healthy=database['healthy'] and cli_ok and ami == 'healthy',
-                restartable=database['healthy'] and (not cli_ok or ami == 'unreachable'))
+                restartable=database['healthy'] and not shutting_down and (not cli_ok or ami == 'unreachable'))
 
 
 def database_tick(c, st, h, statepath):
@@ -541,6 +917,10 @@ def database_tick(c, st, h, statepath):
                not st.get('database_recovery_blocked') and not st.get('recovery_blocked') and
                now - st.get('last_database_start', 0) >= c['cooldown'] and
                len(attempts) < c['max_restarts_hour'])
+    if len(attempts) >= c['max_restarts_hour']:
+        st['database_recovery_blocked'] = True
+        st['database_block_reason'] = 'Hourly database start limit reached'
+        transition(c, st, 'MariaDB recovery lock', 'outage', st['database_block_reason'])
     if not allowed:
         log('MariaDB start deferred: state, policy, cooldown, limit or recovery latch')
         return False
@@ -550,18 +930,23 @@ def database_tick(c, st, h, statepath):
     if not current['startable']:
         log('MariaDB state changed during diagnostics; no start requested')
         return True  # Re-evaluate full health, including a possible independent recovery.
-    st.update(last_database_start=now, database_starts=attempts + [now], database_failures=0)
+    st.update(last_database_start=now, database_starts=attempts + [now], database_failures=0, database_recovery_inflight=True)
     save(statepath, st)
     rc, out, err = run(['systemctl', 'start', 'mariadb.service'], 120, kill_group=False)
-    if rc == 124:
+    if rc:
         st['database_recovery_blocked'] = True
         save(statepath, st)
-    atomic(LOG / 'last-database-start.log', f'exit={rc}\n{out}\n{err}')
-    after = database_health()
+    diagnostic_write(LOG / 'last-database-start.log', f'exit={rc}\n{out}\n{err}')
+    after = verify_database(c)
+    st.pop('database_recovery_inflight', None)
+    if not after['healthy']:
+        st['database_recovery_blocked'] = True
+    if rc or not after['healthy']:
+        st['database_block_reason'] = 'Database start failed or verification did not pass'
     st['last_database_start_result'] = dict(exit=rc, database=after, time=time.time(), evidence=str(evidence))
     save(statepath, st)
-    notify(c, 'MariaDB start attempted', f'systemctl start mariadb.service exit={rc}; '
-           f'post-check={json.dumps(after)}; evidence={evidence}; Asterisk was not restarted.')
+    recovery_notices(c, st)
+    save(statepath, st)
     return True
 
 
@@ -596,7 +981,8 @@ def configure_services():
     print('MariaDB: start-only recovery for a stopped, enabled local service; global recovery policy also applies.')
     print('FastAGI: optional alerts only. Enable only when Sangoma CRM is intentionally in use.')
     for key, label in [('auto_start_mariadb', 'Automatically start stopped MariaDB? y/n'),
-                       ('monitor_fastagi', 'Expect CRM FastAGI on 127.0.0.1:4573? y/n')]:
+                       ('monitor_fastagi', 'Expect CRM FastAGI on 127.0.0.1:4573? y/n'),
+                       ('database_query_check', 'Enable optional root socket SELECT 1 check? y/n')]:
         answer = ask(label, 'y' if c[key] else 'n').lower()
         if answer not in ['y', 'n']:
             raise ValueError('Answer y or n')
@@ -666,7 +1052,7 @@ def show_module_audit(inventory=None):
     for name, impact in OPTIONAL_MODULES.items():
         if name in inventory:
             print(f'  {name}: {impact}')
-    print('Only CRM is confirmed unused for this fleet. Other entries require site-specific confirmation.')
+    print('Every optional module requires confirmation for this site; installed does not mean unused.')
     print('Disabling a module may not stop its existing process or measurably reduce resource use.')
     return inventory
 
@@ -688,10 +1074,12 @@ def require_idle_calls():
         raise RuntimeError('Module change refused: active calls or channel count unknown; retry during maintenance')
 
 
-def apply_module_disable(name, expected):
+def apply_module_disable(name, expected, approval=None):
     """Caller holds operation_lock. One selected module; no force, uninstall or restart."""
     if name not in OPTIONAL_MODULES:
         raise ValueError('Module is protected or not on the reviewed optional-feature list')
+    if not isinstance(approval, dict) or any(not valid_note(approval.get(k)) for k in ['site', 'technician', 'reason']):
+        raise RuntimeError('Site-specific approval requires site, approving technician and reason')
     pending = STATE / 'module-change-pending.json'
     if pending.exists() or fwconsole_busy():
         raise RuntimeError('A module change/fwconsole operation is pending; finish/review it first')
@@ -717,7 +1105,9 @@ def apply_module_disable(name, expected):
            'bash /root/freepbx-care.sh status\nbash /root/freepbx-care.sh resume\n'
            'If a fwconsole operation timed out, check it has finished before further changes.\n'
            'This directory is an inventory/settings backup, not a full PBX/database backup.\n')
-    record = dict(module=name, backup=str(backup), stage='disable requested', time=time.time())
+    record = dict(module=name, backup=str(backup), stage='disable requested', time=time.time(),
+                  approval=approval, server=socket.gethostname())
+    save(backup / 'approval.json', record)
     try:
         # Check again immediately before mutation; native disable checks dependencies again too.
         check_reverse_dependencies(name)
@@ -727,7 +1117,7 @@ def apply_module_disable(name, expected):
         save(pending, record)  # Persist before mutation, including across timeouts/reboots.
         rc, out, err = run(['fwconsole', 'ma', 'disable', name, '--format=json',
                             '--no-ansi', '--no-interaction'], 120, kill_group=False)
-        atomic(backup / 'disable.log', f'exit={rc}\n{out}\n{err}')
+        diagnostic_write(backup / 'disable.log', f'exit={rc}\n{out}\n{err}')
         if rc:
             raise RuntimeError(f'Module disable failed/timed out (exit {rc})')
         records = module_records(out)
@@ -737,7 +1127,7 @@ def apply_module_disable(name, expected):
         record['stage'] = 'reload requested'
         save(pending, record)
         rc, out, err = run(['fwconsole', 'reload', '--no-ansi', '--no-interaction'], 180, kill_group=False)
-        atomic(backup / 'reload.log', f'exit={rc}\n{out}\n{err}')
+        diagnostic_write(backup / 'reload.log', f'exit={rc}\n{out}\n{err}')
         if rc:
             raise RuntimeError(f'Configuration reload failed/timed out (exit {rc})')
         after = module_inventory()
@@ -774,10 +1164,10 @@ def module_review():
     if not choices:
         print('No enabled optional features available to disable. No changes made.')
         return
-    print('Only CRM is confirmed unused for this fleet; verify other features with the site.')
+    print('Every change requires approval for this specific site; installed does not mean unused.')
     while True:
         for index, name in enumerate(choices, 1):
-            hint = ' - confirmed unused in this fleet' if name == 'sangomacrm' else ''
+            hint = ''
             print(f'  {index}. {MODULE_LABELS[name]}{hint}')
         print('  A. View full module audit\n  0. Back without changes')
         choice = ask('Choose a feature number', '0').lower()
@@ -800,8 +1190,11 @@ def module_review():
                 print('Cancelled; no module changes made.')
                 return
             if answer in ['y', 'yes']:
+                approval = {key: ask(label) for key, label in [
+                    ('site', 'Site/property authorizing this change'),
+                    ('technician', 'Approving technician'), ('reason', 'Why is this feature unused at this site?')]}
                 with operation_lock():
-                    apply_module_disable(name, inventory[name])
+                    apply_module_disable(name, inventory[name], approval)
                 return
             print('Answer y or n. Enter keeps the feature enabled.')
 
@@ -855,6 +1248,9 @@ def snapshot(h):
                 ['systemctl', 'status', 'incron', 'mariadb', 'freepbx', 'apache2', '--no-pager'],
                 ['systemctl', '--failed', '--no-pager'],
                 ['ss', '-lntp'],
+                ['journalctl', '-u', 'mariadb', '-b', '-1', '-n', '80', '--no-pager'],
+                ['journalctl', '-u', 'mariadb', '--since', '7 days ago', '-n', '100', '--no-pager'],
+                ['fwconsole', 'pm2', '--list'],
                 ['journalctl', '-u', 'incron', '-u', 'mariadb', '-u', 'freepbx',
                  '-u', 'apache2', '-n', '100', '--no-pager'],
                 ['tail', '-n', '150', '/var/log/asterisk/full'],
@@ -865,9 +1261,12 @@ def snapshot(h):
         if remaining <= 0:
             chunks.append('\nDiagnostic time budget reached; remaining commands skipped.')
             break
-        rc, out, err = run(cmd, min(5, remaining))
-        chunks.append(f'\n$ {" ".join(cmd)} (exit {rc})\n{out}{err}')
-    atomic(dest, '\n'.join(chunks))
+        try:
+            rc, out, err = run(cmd, min(5, remaining))
+        except OSError as e:
+            rc, out, err = 127, '', str(e)
+        chunks.append(f'\n$ {" ".join(cmd)} (exit {rc})\n{out[:32768]}{err[:8192]}')
+    diagnostic_write(dest, '\n'.join(chunks))
     # Bound storage, retaining the most recent twenty incidents.
     for old in sorted(LOG.glob('incident-*.log'))[:-20]:
         old.unlink()
@@ -878,15 +1277,22 @@ def tick(c):
     statepath = STATE / 'state.json'
     st = readjson(statepath, {})
     now = time.time()
+    for prefix in ['', 'database_']:
+        if st.get(prefix + 'recovery_inflight'):
+            st[prefix + 'recovery_blocked'] = True
+            st[prefix + 'block_reason'] = 'Previous recovery interrupted; operator review required'
     boot = Path('/proc/sys/kernel/random/boot_id').read_text().strip()
     if st.get('boot') != boot:
         st.update(boot=boot, failures=0, database_failures=0, fastagi_failures=0)
+        st.pop('observed_asterisk_uptime', None)
         reset_extension_debounce(c)
     # Long scheduling gaps can follow LXC suspension, backup or host overload.
     gap = now - st.get('last_observed', now)
     if gap > 300:
         st.update(failures=0, database_failures=0, fastagi_failures=0, settle_until=now + c['resume_grace'])
         reset_extension_debounce(c)
+        reset_trunk_debounce(c)
+        st.pop('observed_asterisk_uptime', None)
     st['last_observed'] = now
     uptime = float(Path('/proc/uptime').read_text().split()[0])
     paused = (readjson(STATE / 'pause.json', {}).get('until', 0) > now or
@@ -894,12 +1300,16 @@ def tick(c):
     if (paused or uptime < c['boot_grace'] or st.get('settle_until', 0) > now or fwconsole_busy() or
             (STATE / 'module-change-pending.json').exists()):
         st['failures'] = 0
+        st.pop('observed_asterisk_uptime', None)
+        reset_trunk_debounce(c)
         st.update(database_failures=0, fastagi_failures=0)
         reset_extension_debounce(c)
         save(statepath, st)
         log('Monitoring skipped: pause, boot/resume grace, fwconsole operation, or pending module review')
         return
     h = health(c)
+    recovery_notices(c, st)
+    observe_asterisk_restarts(c, st, h, now)
     if not h['database']['healthy']:
         st['failures'] = 0  # Never count a database dependency outage toward an Asterisk restart.
     if database_tick(c, st, h, statepath):
@@ -911,6 +1321,7 @@ def tick(c):
     if not h['database']['healthy']:
         st['fastagi_failures'] = 0
         reset_extension_debounce(c)
+        reset_trunk_debounce(c)
         save(statepath, st)
         log('Asterisk/extension/CRM recovery checks deferred: database dependency unavailable')
         return
@@ -922,6 +1333,10 @@ def tick(c):
         if st['failures'] >= c['failures']:
             transition(c, st, 'PBX', 'outage', json.dumps(h))
             history = [t for t in st.get('restarts', []) if now - t < 3600]
+            if len(history) >= c['max_restarts_hour']:
+                st['recovery_blocked'] = True
+                st['block_reason'] = 'Hourly Asterisk recovery limit reached'
+                transition(c, st, 'Asterisk recovery lock', 'outage', st['block_reason'])
             allowed = (c['auto_restart'] and h['restartable'] and not st.get('recovery_blocked') and
                        now - st.get('last_restart', 0) >= c['cooldown'] and
                        len(history) < c['max_restarts_hour'])
@@ -939,22 +1354,41 @@ def tick(c):
                     return
                 # Capture evidence and persist the attempt BEFORE starting fwconsole.
                 evidence = snapshot(h)
-                st.update(last_restart=now, restarts=history + [now], failures=0)
+                # Diagnostics may take time: do not act on stale health/call information.
+                current = health(c)
+                if fwconsole_busy() or not current['restartable'] or recovery_command(current) != command:
+                    log('Recovery deferred: health/process state changed during diagnostics')
+                    save(statepath, st)
+                    return
+                if c['defer_active_calls'] and current['cli'] and not idle_channels():
+                    log('Recovery deferred: new calls or unknown channel count after diagnostics')
+                    save(statepath, st)
+                    return
+                st.update(last_restart=now, restarts=history + [now], failures=0, recovery_inflight=True)
                 save(statepath, st)
                 log(f'Recovery via {" ".join(command)}; evidence: {evidence}')
                 rc, out, err = run(command, 600, kill_group=False)
-                if rc == 124:
+                if rc:
                     st['recovery_blocked'] = True
                     save(statepath, st)
-                atomic(LOG / 'last-restart.log', f'exit={rc}\n{out}\n{err}')
-                after = health(c)
+                diagnostic_write(LOG / 'last-restart.log', f'exit={rc}\n{out}\n{err}')
+                after = verify_recovery(c)
+                st.pop('recovery_inflight', None)
+                if rc or not after['healthy']:
+                    st['recovery_blocked'] = True
+                    st['block_reason'] = 'Recovery command failed or post-recovery verification did not pass'
                 failed_evidence = str(snapshot(after)) if rc or not after['healthy'] else None
                 st['last_restart_result'] = dict(exit=rc, command=command, health=after, time=time.time(),
                                                 failure_evidence=failed_evidence)
-                notify(c, 'recovery attempted', f'{" ".join(command)} exit={rc}; post-check={json.dumps(after)}; evidence={evidence}; failure evidence={failed_evidence}')
+                recovery_notices(c, st)
                 log(f'Restart completed: exit={rc}; health={after}')
             elif not h['restartable']:
                 log('Configuration/authentication/protocol problem: automatic restart suppressed')
+    if st.get('last_restart_result', {}).get('time', 0) >= now:
+        h = st['last_restart_result']['health']
+        st['last_health'] = dict(h, time=time.time())
+        if h.get('asterisk_uptime') is not None:
+            st['observed_asterisk_uptime'] = h['asterisk_uptime']
     fastagi_tick(c, st, h['healthy'])
     save(statepath, st)
     # Optional extension checks run after the core watchdog and cannot request recovery.
@@ -962,6 +1396,10 @@ def tick(c):
         extensions_tick(c, h['healthy'])
     except (RuntimeError, ValueError, OSError) as e:
         log(f'Extension monitoring failed: {e}; core PBX check completed')
+    try:
+        trunks_tick(c, h['healthy'])
+    except (RuntimeError, ValueError, OSError) as e:
+        log(f'Trunk monitoring failed: {e}; core PBX check completed')
 
 
 def ask(label, default='', secret=False):
@@ -1282,22 +1720,37 @@ def menu_action(choice):
         elif choice == '11': print('Extension status (no email/restart):', json.dumps(extension_report(config()), indent=2))
         elif choice == '12': configure_services()
         elif choice == '14': crash_audit()
+        elif choice == '15': configure_trunks()
+        elif choice == '16': print(json.dumps(trunk_report(config()), indent=2))
+        elif choice == '17': configure_exclusion()
+        elif choice == '18':
+            if ask('Reviewed recovery evidence and safe to unlock? y/n', 'n').lower() in ['y', 'yes']:
+                recovery_unlock()
 
 
 def menu():
     while True:
-        print(f'\nFreePBX Care {VERSION}\n1 Configure Asterisk monitor\n2 Install/update monitoring\n3 Configure SMTP relay\n4 Read-only health/status\n5 Send test email\n6 Pause monitoring\n7 Resume monitoring\n8 Disable monitoring\n9 Collect diagnostics (no restart)\n10 Configure extension monitoring\n11 Read-only extension status\n12 Configure MariaDB / CRM checks\n13 Review/disable unused optional modules\n14 Investigate crash/resource issues\n0 Exit')
+        print(f'\nFreePBX Care {VERSION}\n1 Configure Asterisk monitor\n2 Install/update monitoring\n3 Configure SMTP relay\n4 Read-only health/status\n5 Send test email\n6 Pause monitoring\n7 Resume monitoring\n8 Disable monitoring\n9 Collect diagnostics (no restart)\n10 Configure extension monitoring\n11 Read-only extension status\n12 Configure MariaDB / CRM checks\n13 Review/disable unused optional modules\n14 Investigate crash/resource issues\n15 Configure SIP trunk alerts\n16 Read-only SIP trunk status\n17 Property/trunk maintenance exclusion\n18 Unlock recovery after review\n0 Exit')
         choice = ask('Choose', '0')
         if choice == '0':
             return
         try:
             menu_action(choice)
         except (RuntimeError, ValueError, OSError) as e:
-            print('ERROR:', e)
+            print('ERROR:', redact(e))
 
 
 def status():
     print('Version:', VERSION)
+    saved = readjson(STATE / 'state.json', {})
+    print('Automatic recovery locks:', json.dumps(dict(
+        asterisk=bool(saved.get('recovery_blocked') or saved.get('recovery_inflight')),
+        mariadb=bool(saved.get('database_recovery_blocked') or saved.get('database_recovery_inflight')),
+        asterisk_reason=saved.get('block_reason'), mariadb_reason=saved.get('database_block_reason'))))
+    print('Resume clears maintenance; recovery-unlock separately reviews recovery locks. Neither starts a stopped timer.')
+    print('Trunk settings:', json.dumps(config()['trunk_monitor'], indent=2))
+    print('Saved trunk state:', json.dumps(readjson(STATE / 'trunks.json', {}), indent=2))
+    print('Scoped maintenance:', json.dumps(readjson(STATE / 'exclusions.json', {}), indent=2))
     print('Current health:', json.dumps(health(config()), indent=2))
     print('AMI configuration (no secrets):', json.dumps(ami_config_report(config())))
     print('Saved state:', json.dumps(readjson(STATE / 'state.json', {}), indent=2))
@@ -1342,10 +1795,12 @@ def resume():
         pending.unlink()
     save(STATE / 'pause.json', dict(until=0))
     st = readjson(STATE / 'state.json', {})
-    st.update(recovery_blocked=False, database_recovery_blocked=False, failures=0,
-              database_failures=0, fastagi_failures=0)
+    st.update(failures=0, database_failures=0, fastagi_failures=0,
+              settle_until=time.time() + config()['resume_grace'])
     save(STATE / 'state.json', st)
-    print('Manual pause, reviewed module-change hold and recovery timeout latches cleared. Backup pause remains independent.')
+    print('Manual pause and reviewed module-change hold cleared; settling grace applied. Backup pause remains independent.')
+    if st.get('recovery_blocked') or st.get('database_recovery_blocked'):
+        print('Automatic recovery remains locked. Review diagnostics, then use recovery-unlock explicitly.')
 
 
 def main():
@@ -1353,7 +1808,7 @@ def main():
     parser.add_argument('command', nargs='?', default='menu', choices=[
         'menu', 'configure', 'install', 'preflight', 'smtp', 'status', 'diagnose', 'check', 'test-mail',
         'pause', 'resume', 'backup-pause', 'backup-resume', 'disable', 'extensions', 'extensions-status', 'services',
-        'modules', 'module-audit', 'crash-audit'])
+        'modules', 'module-audit', 'crash-audit', 'trunks', 'trunks-status', 'exclusions', 'recovery-unlock'])
     parser.add_argument('--minutes', type=int, default=60)
     parser.add_argument('--smtp-config', help='root-owned mode-600 SMTP profile JSON')
     parser.add_argument('--version', action='version', version=VERSION)
@@ -1378,6 +1833,10 @@ def main():
         elif args.command == 'configure': configure()
         elif args.command == 'extensions': configure_extensions()
         elif args.command == 'services': configure_services()
+        elif args.command == 'trunks': configure_trunks()
+        elif args.command == 'trunks-status': print(json.dumps(trunk_report(config()), indent=2))
+        elif args.command == 'exclusions': configure_exclusion()
+        elif args.command == 'recovery-unlock': recovery_unlock()
         elif args.command == 'module-audit': show_module_audit()
         elif args.command == 'crash-audit': crash_audit()
         elif args.command == 'extensions-status': print(json.dumps(extension_report(config()), indent=2))
@@ -1398,7 +1857,7 @@ if __name__ == '__main__':
     try:
         main()
     except (RuntimeError, ValueError, OSError) as e:
-        print(f'ERROR: {e}', file=sys.stderr)
+        print(f'ERROR: {redact(e)}', file=sys.stderr)
         sys.exit(1)
 PYTHON
 )" "$0" "$@"

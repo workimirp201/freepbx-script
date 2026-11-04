@@ -16,7 +16,7 @@ import urllib.request
 
 if sys.argv[0] == '-c': sys.argv = sys.argv[1:]
 URL = 'https://raw.githubusercontent.com/workimirp201/freepbx-script/refs/heads/main/freepbx-care.sh'
-EXPECTED_SHA256 = '4e79638140ad98efe3ec3e433e6fe6473806a631979ac92c2dbe87cbd2276a76'
+EXPECTED_SHA256 = '5f04c6c140a7413467116a1d548c430099529767bc8e95e5beb31c2c3fbbb726'
 
 PAYLOAD = r'''
 import datetime, fcntl, hashlib, json, os, pathlib, shutil, subprocess, sys, tempfile
@@ -45,6 +45,7 @@ if service.is_file() and 'ExecStart=/bin/bash /root/freepbx-care.sh check' not i
 if timer.is_file() and 'Unit=freepbx-care.service' not in timer.read_text():
     raise RuntimeError('Unrecognized/custom monitoring timer; review manually')
 original = script.read_bytes()
+original_settings = settings.read_bytes()
 if b'def tick(c):' not in original or b'freepbx-care' not in original:
     raise RuntimeError('Unrecognized current script; review manually')
 if pathlib.Path('/var/lib/freepbx-care/module-change-pending.json').exists():
@@ -70,12 +71,23 @@ def atomic(path, contents, mode):
         if os.path.exists(name): os.unlink(name)
 def update():
     validate()
-    if script.read_bytes() != original:
-        raise RuntimeError('Script changed during inspection; retry')
-    if original == raw and not needs_install:
+    if script.read_bytes() != original or settings.read_bytes() != original_settings:
+        raise RuntimeError('Script/settings changed during inspection; retry')
+    enable_core = data.get('enable_core_fastagi', False)
+    new_settings = original_settings
+    if enable_core:
+        if 'recover_core_fastagi' not in namespace.get('DEFAULT', {}):
+            raise RuntimeError('Downloaded script does not support Core FastAGI recovery')
+        config = json.loads(original_settings)
+        if not isinstance(config, dict): raise RuntimeError('Care settings must be a JSON object')
+        if config.get('recover_core_fastagi') is not True:
+            config['recover_core_fastagi'] = True
+            new_settings = (json.dumps(config, indent=2) + '\n').encode('utf-8')
+    if original == raw and not needs_install and new_settings == original_settings:
         return dict(result='current', version=namespace['VERSION'])
     if not data['apply']:
-        return dict(result='preview', version=namespace['VERSION'], install_missing_units=needs_install)
+        return dict(result='preview', version=namespace['VERSION'], install_missing_units=needs_install,
+                    enable_core_fastagi=enable_core)
     backup = pathlib.Path('/var/lib/freepbx-care') / ('update-backup-' + datetime.datetime.now().strftime('%Y%m%d-%H%M%S-%f'))
     backup.mkdir(mode=0o700, parents=True)
     shutil.copy2(script, backup / 'freepbx-care.sh')
@@ -83,15 +95,20 @@ def update():
     for unit in [service, timer]:
         if unit.is_file(): shutil.copy2(unit, backup / unit.name)
     (backup / 'manifest.json').write_text(json.dumps(dict(
-        install_missing_units=needs_install, service_existed=service.is_file(), timer_existed=timer.is_file()), indent=2))
+        install_missing_units=needs_install, service_existed=service.is_file(), timer_existed=timer.is_file(),
+        enable_core_fastagi=enable_core), indent=2))
     for file in backup.iterdir(): os.chmod(file, 0o600)
     mode = script.stat().st_mode & 0o777
     try:
         atomic(script, raw, 0o700)
         if hashlib.sha256(script.read_bytes()).hexdigest() != data['sha256']:
             raise RuntimeError('Installed hash verification failed')
+        if new_settings != original_settings:
+            atomic(settings, new_settings, 0o600)
     except Exception:
         atomic(script, original, mode)
+        if settings.read_bytes() != original_settings:
+            atomic(settings, original_settings, 0o600)
         raise
     if needs_install:
         try:
@@ -135,7 +152,7 @@ def cluster_nodes(rows):
     return nodes
 
 
-def update_cluster(apply, install_missing=False, exclude=()):
+def update_cluster(apply, install_missing=False, exclude=(), enable_core_fastagi=False):
     nodes = cluster_nodes(json.loads(run(['pvesh', 'get', '/cluster/status', '--output-format', 'json'])))
     source = Path(sys.argv[0]).read_text()
     failed = []
@@ -151,6 +168,7 @@ def update_cluster(apply, install_missing=False, exclude=()):
                 options = {}
                 if install_missing: options['install_missing'] = True
                 if exclude: options['exclude'] = exclude
+                if enable_core_fastagi: options['enable_core_fastagi'] = True
                 rc = update_local([], True, apply, **options)
             except (RuntimeError, ValueError, OSError, subprocess.TimeoutExpired) as e:
                 print(f'NODE {name}: {e}', flush=True)
@@ -158,6 +176,7 @@ def update_cluster(apply, install_missing=False, exclude=()):
         else:
             command = 'bash -s -- --all-running-freepbx' + (' --apply' if apply else '')
             if install_missing: command += ' --install-missing'
+            if enable_core_fastagi: command += ' --enable-core-fastagi'
             for ctid in exclude: command += ' --exclude-ctid ' + ctid
             try:
                 # Execute this reviewed helper in memory; no peer host script/credentials are installed.
@@ -172,7 +191,7 @@ def update_cluster(apply, install_missing=False, exclude=()):
     return 1 if failed else 0
 
 
-def update_local(explicit, all_running, apply, install_missing=False, exclude=()):
+def update_local(explicit, all_running, apply, install_missing=False, exclude=(), enable_core_fastagi=False):
     listing = run(['pct', 'list'], timeout=30)
     ctids = list(dict.fromkeys(explicit)) if not all_running else [
         row[0] for line in listing.splitlines()[1:] if len(row := line.split()) >= 2
@@ -207,7 +226,8 @@ def update_local(explicit, all_running, apply, install_missing=False, exclude=()
                     ['pct', 'status', ctid], timeout=15) != 'status: running':
                 raise RuntimeError('Container stopped or became locked; retry later')
             out = run(['pct', 'exec', ctid, '--', 'python3', '-c', PAYLOAD], timeout=420 if install_missing else 120,
-                      data=json.dumps(dict(script=source, sha256=EXPECTED_SHA256, apply=apply, install_missing=install_missing)))
+                      data=json.dumps(dict(script=source, sha256=EXPECTED_SHA256, apply=apply, install_missing=install_missing,
+                                           enable_core_fastagi=enable_core_fastagi)))
             print(out, flush=True)
             markers = [line.split('=', 1)[1] for line in out.splitlines() if line.startswith('FREEPBX_UPDATE_RESULT=')]
             if len(markers) != 1:
@@ -220,7 +240,10 @@ def update_local(explicit, all_running, apply, install_missing=False, exclude=()
             print(f'FAILED CT {ctid}: {e}', flush=True)
             totals['failed'].append(ctid)
     print('Summary:', json.dumps(totals), flush=True)
-    print('Existing SMTP, pauses, recovery settings, extension groups and modules are preserved. No cleanup or test mail was run.')
+    print('Existing SMTP, pauses, global recovery settings, extension groups and modules are preserved. No cleanup or test mail was run.')
+    if enable_core_fastagi:
+        print('Core FastAGI service recovery requested; applies only with --apply. Global recovery must already be enabled.')
+        print('FastAGI execution mode is preserved; sites using local AGI remain unchanged. No recovery command ran during this update.')
     print('Existing complete installations retain their timer state.')
     print('Missing service/timer units may be installed and enabled only with --install-missing --apply.')
     print('Stopped containers were not selected in all-running mode; update them later when normally running.')
@@ -233,6 +256,8 @@ def main():
     group.add_argument('--cluster', action='store_true', help='visit all online cluster nodes using existing trusted root SSH')
     group.add_argument('--all-running-freepbx', action='store_true', help='existing Care installations on this node')
     parser.add_argument('--apply', action='store_true')
+    parser.add_argument('--enable-core-fastagi', action='store_true',
+                        help='enable guarded Core service recovery in saved Care settings; preserves global recovery and FastAGI mode')
     parser.add_argument('--install-missing', action='store_true',
                         help='also complete missing Care service/timer for an existing script/config, preserving saved settings')
     parser.add_argument('--exclude-ctid', action='append', default=[], help='skip this numeric CTID; repeat to exclude more')
@@ -243,9 +268,11 @@ def main():
     if args.ctids and (args.cluster or args.all_running_freepbx): parser.error('Choose explicit CTIDs OR an all/cluster mode')
     if not args.ctids and not (args.cluster or args.all_running_freepbx): parser.error('Specify CTIDs, --all-running-freepbx or --cluster')
     if args.cluster:
-        return update_cluster(args.apply, install_missing=args.install_missing, exclude=args.exclude_ctid)
+        return update_cluster(args.apply, install_missing=args.install_missing, exclude=args.exclude_ctid,
+                              enable_core_fastagi=args.enable_core_fastagi)
     return update_local(args.ctids, args.all_running_freepbx, args.apply,
-                        install_missing=args.install_missing, exclude=args.exclude_ctid)
+                        install_missing=args.install_missing, exclude=args.exclude_ctid,
+                        enable_core_fastagi=args.enable_core_fastagi)
 
 
 if __name__ == '__main__':

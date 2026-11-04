@@ -33,7 +33,7 @@ ETC = Path('/etc/freepbx-care')
 STATE = Path('/var/lib/freepbx-care')
 LOG = Path('/var/log/freepbx-care')
 SELF = Path('/root/freepbx-care.sh')
-VERSION = '2026.10.29-local-care-r8.1'
+VERSION = '2026.11.04-local-care-r8.3'
 # Deprecated CLI globals retained for compatibility with already deployed helpers.
 EXPERIMENTAL_DEBIAN13 = False
 EXPERIMENTAL_RECOVERY = False
@@ -42,7 +42,7 @@ DEFAULT = dict(email='monitor@famecomputers.com', sender='', auto_restart=True,
                failures=3, cooldown=1800, max_restarts_hour=2, boot_grace=300,
                resume_grace=180, defer_active_calls=True, ami={},
                extension_monitor=dict(enabled=False, failures=3, groups=[]),
-               auto_start_mariadb=True, monitor_fastagi=False,
+               auto_start_mariadb=True, monitor_fastagi=False, recover_core_fastagi=False,
                database_query_check=False,
                trunk_monitor=dict(enabled=False, failures=3, recovery_checks=2, trunks=[]))
 
@@ -162,7 +162,7 @@ def validate(c):
                            ('resume_grace', 60, 900)]:
         if type(c[key]) is not int or not low <= c[key] <= high:
             raise ValueError(f'Invalid {key}: expected {low}..{high}')
-    for key in ['auto_restart', 'defer_active_calls', 'auto_start_mariadb', 'monitor_fastagi']:
+    for key in ['auto_restart', 'defer_active_calls', 'auto_start_mariadb', 'monitor_fastagi', 'recover_core_fastagi']:
         if type(c[key]) is not bool:
             raise ValueError(f'{key} must be boolean')
     validate_extensions(c['extension_monitor'])
@@ -236,8 +236,11 @@ def diagnostic_write(path, text):
 def recovery_notices(c, st):
     """Keep one deduplicated, retryable result for each local recovery type."""
     for key, label, health_key in [('last_restart_result', 'Asterisk recovery', 'health'),
-                                    ('last_database_start_result', 'MariaDB start', 'database')]:
+                                    ('last_database_start_result', 'MariaDB start', 'database'),
+                                    ('last_core_fastagi_result', 'Core FastAGI recovery', 'health')]:
         result = st.get(key)
+        if key == 'last_core_fastagi_result' and result and result.get('command') != ['fwconsole', 'start', '--post', 'core']:
+            continue  # Historical r8.2 fallback is not a verified Core service restoration.
         if result:
             outcome = 'verified' if result['exit'] == 0 and result[health_key]['healthy'] else 'failed'
             token = str(result['time']) + ' ' + outcome
@@ -311,11 +314,15 @@ def recovery_unlock():
     if not h['healthy']:
         raise RuntimeError('Restore database/CLI/AMI health before unlocking automatic recovery')
     st = readjson(STATE / 'state.json', {})
+    if (st.get('core_fastagi_recovery_blocked') or st.get('core_fastagi_recovery_inflight')) and not verify_core_fastagi(c)['healthy']:
+        raise RuntimeError('Restore FastAGI mode, Core services and PBX health before unlocking Core recovery')
     reviewed = {k: st.get(k) for k in ['block_reason', 'database_block_reason',
-                 'last_restart_result', 'last_database_start_result']}
+                 'last_restart_result', 'last_database_start_result', 'last_core_fastagi_result', 'core_fastagi_block_reason']}
     st.update(recovery_blocked=False, database_recovery_blocked=False, failures=0,
+              core_fastagi_recovery_blocked=False, core_fastagi_failures=0,
               database_failures=0, settle_until=time.time() + c['resume_grace'])
-    for key in ['recovery_inflight', 'database_recovery_inflight', 'block_reason', 'database_block_reason']:
+    for key in ['recovery_inflight', 'database_recovery_inflight', 'block_reason', 'database_block_reason',
+                'core_fastagi_recovery_inflight', 'core_fastagi_block_reason']:
         st.pop(key, None)
     # Attempt timestamps remain intact: unlock cannot bypass cooldown/hourly limits.
     save(STATE / 'state.json', st)
@@ -969,6 +976,141 @@ def fastagi_health():
         return False
 
 
+def core_fastagi_mode():
+    """Read one boolean through FreePBX; no credential output or settings mutation."""
+    code = r'''$bootstrap_settings['skip_astman']=true;
+ob_start(); try { require '/etc/freepbx.conf';
+$v=\FreePBX::Config()->get('LAUNCH_AGI_AS_FASTAGI');
+if(!in_array($v,[true,false,1,0,'1','0'],true)) { ob_end_clean(); exit(1); }
+ob_end_clean(); echo json_encode(['enabled'=>in_array($v,[true,1,'1'],true)]);
+} catch (\Throwable $e) { while(ob_get_level()) ob_end_clean(); exit(1); }'''
+    rc, out, _ = run(['php', '-r', code], 20)
+    try:
+        value = json.loads(out)
+        if rc == 0 and type(value.get('enabled')) is bool:
+            return value['enabled']
+    except (ValueError, AttributeError):
+        pass
+    return None
+
+
+def core_services_status():
+    """Read only the two Core PM2 states; never export process environments/secrets."""
+    code = r'''$bootstrap_settings['skip_astman']=true;
+ob_start(); try { require '/etc/freepbx.conf';
+$enabled=(bool)\FreePBX::Modules()->checkStatus('pm2');
+$r=['pm2_enabled'=>$enabled];
+foreach(['core-fastagi','core-calltransfer-monitor'] as $name) {
+    $v=$enabled ? \FreePBX::Pm2()->getStatus($name) : false;
+    $r[$name]=is_array($v) && ($v['pm2_env']['status'] ?? '')==='online' && (int)($v['pid'] ?? 0)>0;
+}
+ob_end_clean(); echo json_encode($r);
+} catch (\Throwable $e) { while(ob_get_level()) ob_end_clean(); exit(1); }'''
+    rc, out, _ = run(['php', '-r', code], 30)
+    try:
+        value = json.loads(out)
+        keys = ['pm2_enabled', 'core-fastagi', 'core-calltransfer-monitor']
+        if rc == 0 and isinstance(value, dict) and all(type(value.get(k)) is bool for k in keys):
+            return {key: value[key] for key in keys}
+    except ValueError:
+        pass
+    return None
+
+
+def verify_core_fastagi(c):
+    """Two consecutive healthy probes; does not claim to place an end-to-end call."""
+    consecutive = 0
+    result = dict(healthy=False)
+    for attempt in range(3):
+        mode, services = core_fastagi_mode(), core_services_status()
+        listening = fastagi_health()
+        h = health(c)
+        good = (mode is True and listening and services is not None and all(services.values()) and
+                h['healthy'] and not h.get('shutting_down'))
+        result = dict(healthy=bool(good), fastagi_enabled=mode, listening=listening,
+                      services=services, pbx_healthy=h['healthy'])
+        consecutive = consecutive + 1 if good else 0
+        if consecutive >= 2:
+            return result
+        if attempt < 2:
+            time.sleep(2)
+    return dict(result, healthy=False, verification='Two consecutive healthy Core service probes did not pass')
+
+
+def core_fastagi_change_safe(c, st):
+    now = time.time()
+    if (fwconsole_busy() or (STATE / 'module-change-pending.json').exists() or
+            readjson(STATE / 'pause.json', {}).get('until', 0) > now or
+            readjson(STATE / 'backup-pause.json', {}).get('until', 0) > now or
+            st.get('settle_until', 0) > now):
+        return False
+    h = health(c)
+    return h['healthy'] and not h.get('shutting_down') and idle_channels()
+
+
+def core_fastagi_tick(c, st, pbx_healthy):
+    """Opt-in Core service restoration. Never change FastAGI mode or reload/restart Asterisk."""
+    if not c['recover_core_fastagi'] or not pbx_healthy:
+        st['core_fastagi_failures'] = 0
+        return
+    mode = core_fastagi_mode()
+    if mode is not True:
+        st['core_fastagi_failures'] = 0
+        st['last_core_fastagi'] = dict(enabled=mode, status='disabled' if mode is False else 'unknown', time=time.time())
+        log('Core service recovery skipped: FastAGI mode disabled or unreadable; setting preserved')
+        return
+    services, listening = core_services_status(), fastagi_health()
+    st['last_core_fastagi'] = dict(enabled=mode, listening=listening, services=services, time=time.time())
+    if services is None:
+        st['core_fastagi_failures'] = 0
+        transition(c, st, 'Core FastAGI', 'unknown', 'Cannot read Core PM2 states; no automatic action permitted.')
+        return
+    if listening and all(services.values()):
+        st['core_fastagi_failures'] = 0
+        transition(c, st, 'Core FastAGI', 'healthy', 'FastAGI listener and both Core PM2 services are online.')
+        return
+    st['core_fastagi_failures'] = st.get('core_fastagi_failures', 0) + 1
+    if st['core_fastagi_failures'] < c['failures']:
+        return
+    transition(c, st, 'Core FastAGI', 'outage', 'FastAGI mode is enabled but its listener or Core PM2 services are unavailable.')
+    now = time.time()
+    attempts = [t for t in st.get('core_fastagi_attempts', []) if 0 <= now - t < 3600]
+    if (not c['auto_restart'] or not services['pm2_enabled'] or
+            st.get('recovery_blocked') or st.get('database_recovery_blocked') or
+            st.get('core_fastagi_recovery_blocked') or st.get('core_fastagi_recovery_inflight') or
+            now - st.get('last_core_fastagi_attempt', 0) < c['cooldown'] or
+            len(attempts) >= c['max_restarts_hour']):
+        return
+    if not core_fastagi_change_safe(c, st):
+        return
+    evidence = snapshot(dict(core_fastagi=st['last_core_fastagi']))
+    # Recheck after diagnostics: no work during a setting change, transient failure or new calls.
+    services = core_services_status()
+    if (not core_fastagi_change_safe(c, st) or core_fastagi_mode() is not True or
+            services is None or not services['pm2_enabled'] or (fastagi_health() and all(services.values()))):
+        return
+    st.update(core_fastagi_recovery_inflight=True, last_core_fastagi_attempt=now,
+              core_fastagi_attempts=attempts + [now])
+    statepath = STATE / 'state.json'
+    save(statepath, st)  # Persist before action. Timeout/interruption must not trigger overlapping hooks.
+    command = ['fwconsole', 'start', '--post', 'core']
+    rc, out, err = run(command, 180, kill_group=False)
+    diagnostic_write(LOG / 'last-core-fastagi-recovery.log', f'exit={rc}\n{out}\n{err}')
+    after = verify_core_fastagi(c) if rc == 0 else dict(healthy=False)
+    st.pop('core_fastagi_recovery_inflight', None)
+    if rc or not after['healthy']:
+        st['core_fastagi_recovery_blocked'] = True
+        st['core_fastagi_block_reason'] = 'Core service restoration failed/unverified; review logs and any continuing fwconsole process'
+    st['last_core_fastagi_result'] = dict(exit=rc, command=command, health=after, time=time.time(), evidence=str(evidence))
+    st['settle_until'] = time.time() + c['resume_grace']
+    if after['healthy']:
+        st['core_fastagi_failures'] = 0
+        transition(c, st, 'Core FastAGI', 'healthy', 'Core services restored; FastAGI mode remains enabled. Confirm real calls.')
+    save(statepath, st)
+    recovery_notices(c, st)
+    save(statepath, st)
+
+
 def fastagi_tick(c, st, pbx_healthy):
     if not c['monitor_fastagi'] or not pbx_healthy:
         st['fastagi_failures'] = 0
@@ -989,10 +1131,13 @@ def fastagi_tick(c, st, pbx_healthy):
 def configure_services():
     c = config()
     print('MariaDB: start-only recovery for a stopped, enabled local service; global recovery policy also applies.')
-    print('FastAGI: optional alerts only. Enable only when Sangoma CRM is intentionally in use.')
+    print('CRM listener alerts and Core service recovery are separate optional features.')
+    print('Core recovery runs fwconsole start --post core after repeated failures, only when PBX health and calls are safe.')
+    print('It may restart the Call Transfer Monitoring Service. It never changes FastAGI mode, reloads configuration or restarts Asterisk.')
     for key, label in [('auto_start_mariadb', 'Automatically start stopped MariaDB? y/n'),
                        ('monitor_fastagi', 'Expect CRM FastAGI on 127.0.0.1:4573? y/n'),
-                       ('database_query_check', 'Enable optional root socket SELECT 1 check? y/n')]:
+                       ('database_query_check', 'Enable optional root socket SELECT 1 check? y/n'),
+                       ('recover_core_fastagi', 'Automatically restore missing/unhealthy Core FastAGI services? y/n')]:
         answer = ask(label, 'y' if c[key] else 'n').lower()
         if answer not in ['y', 'n']:
             raise ValueError('Answer y or n')
@@ -1000,7 +1145,7 @@ def configure_services():
     validate(c)
     save(ETC / 'config.json', c)
     st = readjson(STATE / 'state.json', {})
-    st.update(database_failures=0, fastagi_failures=0)
+    st.update(database_failures=0, fastagi_failures=0, core_fastagi_failures=0)
     save(STATE / 'state.json', st)
     print('Service settings saved. No service or module was changed.')
 
@@ -1287,19 +1432,19 @@ def tick(c):
     statepath = STATE / 'state.json'
     st = readjson(statepath, {})
     now = time.time()
-    for prefix in ['', 'database_']:
+    for prefix in ['', 'database_', 'core_fastagi_']:
         if st.get(prefix + 'recovery_inflight'):
             st[prefix + 'recovery_blocked'] = True
             st[prefix + 'block_reason'] = 'Previous recovery interrupted; operator review required'
     boot = Path('/proc/sys/kernel/random/boot_id').read_text().strip()
     if st.get('boot') != boot:
-        st.update(boot=boot, failures=0, database_failures=0, fastagi_failures=0)
+        st.update(boot=boot, failures=0, database_failures=0, fastagi_failures=0, core_fastagi_failures=0)
         st.pop('observed_asterisk_uptime', None)
         reset_extension_debounce(c)
     # Long scheduling gaps can follow LXC suspension, backup or host overload.
     gap = now - st.get('last_observed', now)
     if gap > 300:
-        st.update(failures=0, database_failures=0, fastagi_failures=0, settle_until=now + c['resume_grace'])
+        st.update(failures=0, database_failures=0, fastagi_failures=0, core_fastagi_failures=0, settle_until=now + c['resume_grace'])
         reset_extension_debounce(c)
         reset_trunk_debounce(c)
         st.pop('observed_asterisk_uptime', None)
@@ -1312,7 +1457,7 @@ def tick(c):
         st['failures'] = 0
         st.pop('observed_asterisk_uptime', None)
         reset_trunk_debounce(c)
-        st.update(database_failures=0, fastagi_failures=0)
+        st.update(database_failures=0, fastagi_failures=0, core_fastagi_failures=0)
         reset_extension_debounce(c)
         save(statepath, st)
         log('Monitoring skipped: pause, boot/resume grace, fwconsole operation, or pending module review')
@@ -1330,6 +1475,7 @@ def tick(c):
     st['last_health'] = dict(h, time=now)
     if not h['database']['healthy']:
         st['fastagi_failures'] = 0
+        st['core_fastagi_failures'] = 0
         reset_extension_debounce(c)
         reset_trunk_debounce(c)
         save(statepath, st)
@@ -1400,6 +1546,7 @@ def tick(c):
         if h.get('asterisk_uptime') is not None:
             st['observed_asterisk_uptime'] = h['asterisk_uptime']
     fastagi_tick(c, st, h['healthy'])
+    core_fastagi_tick(c, st, h['healthy'])
     save(statepath, st)
     # Optional extension checks run after the core watchdog and cannot request recovery.
     try:
@@ -1752,7 +1899,7 @@ def menu_action(choice):
 
 def menu():
     while True:
-        print(f'\nFreePBX Care {VERSION}\n1 Configure Asterisk monitor\n2 Install/update monitoring\n3 Configure SMTP relay\n4 Read-only health/status\n5 Send test email\n6 Pause monitoring\n7 Resume monitoring\n8 Disable monitoring\n9 Collect diagnostics (no restart)\n10 Configure extension monitoring\n11 Read-only extension status\n12 Configure MariaDB / CRM checks\n13 Review/disable unused optional modules\n14 Investigate crash/resource issues\n15 Configure SIP trunk alerts\n16 Read-only SIP trunk status\n17 Property/trunk maintenance exclusion\n18 Unlock recovery after review\n0 Exit')
+        print(f'\nFreePBX Care {VERSION}\n1 Configure Asterisk monitor\n2 Install/update monitoring\n3 Configure SMTP relay\n4 Read-only health/status\n5 Send test email\n6 Pause monitoring\n7 Resume monitoring\n8 Disable monitoring\n9 Collect diagnostics (no restart)\n10 Configure extension monitoring\n11 Read-only extension status\n12 Configure MariaDB / CRM / Core FastAGI\n13 Review/disable unused optional modules\n14 Investigate crash/resource issues\n15 Configure SIP trunk alerts\n16 Read-only SIP trunk status\n17 Property/trunk maintenance exclusion\n18 Unlock recovery after review\n0 Exit')
         choice = ask('Choose', '0')
         if choice == '0':
             return
@@ -1771,6 +1918,8 @@ def status():
     print('Automatic recovery locks:', json.dumps(dict(
         asterisk=bool(saved.get('recovery_blocked') or saved.get('recovery_inflight')),
         mariadb=bool(saved.get('database_recovery_blocked') or saved.get('database_recovery_inflight')),
+        core_fastagi=bool(saved.get('core_fastagi_recovery_blocked') or saved.get('core_fastagi_recovery_inflight')),
+        core_fastagi_reason=saved.get('core_fastagi_block_reason'),
         asterisk_reason=saved.get('block_reason'), mariadb_reason=saved.get('database_block_reason'))))
     print('Resume clears maintenance; recovery-unlock separately reviews recovery locks. Neither starts a stopped timer.')
     print('Trunk settings:', json.dumps(config()['trunk_monitor'], indent=2))
@@ -1789,6 +1938,8 @@ def status():
     print('MariaDB automatic start:', c['auto_start_mariadb'], '(requires automatic recovery enabled)')
     print('CRM FastAGI:', json.dumps(dict(monitored=c['monitor_fastagi'],
           listening=fastagi_health() if c['monitor_fastagi'] else None)))
+    print('Core FastAGI automatic service recovery:', c['recover_core_fastagi'], '(requires automatic recovery enabled)')
+    print('Saved Core FastAGI state:', json.dumps(saved.get('last_core_fastagi', {})))
     rc, out, err = run(['systemctl', 'status', 'freepbx-care.timer', '--no-pager'])
     print(out, err)
 
@@ -1821,11 +1972,11 @@ def resume():
         pending.unlink()
     save(STATE / 'pause.json', dict(until=0))
     st = readjson(STATE / 'state.json', {})
-    st.update(failures=0, database_failures=0, fastagi_failures=0,
+    st.update(failures=0, database_failures=0, fastagi_failures=0, core_fastagi_failures=0,
               settle_until=time.time() + config()['resume_grace'])
     save(STATE / 'state.json', st)
     print('Manual pause and reviewed module-change hold cleared; settling grace applied. Backup pause remains independent.')
-    if st.get('recovery_blocked') or st.get('database_recovery_blocked'):
+    if st.get('recovery_blocked') or st.get('database_recovery_blocked') or st.get('core_fastagi_recovery_blocked'):
         print('Automatic recovery remains locked. Review diagnostics, then use recovery-unlock explicitly.')
 
 

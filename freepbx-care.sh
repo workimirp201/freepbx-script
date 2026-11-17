@@ -33,7 +33,7 @@ ETC = Path('/etc/freepbx-care')
 STATE = Path('/var/lib/freepbx-care')
 LOG = Path('/var/log/freepbx-care')
 SELF = Path('/root/freepbx-care.sh')
-VERSION = '2026.11.04-local-care-r8.3'
+VERSION = '2026.11.17-local-care-r8.4'
 # Deprecated CLI globals retained for compatibility with already deployed helpers.
 EXPERIMENTAL_DEBIAN13 = False
 EXPERIMENTAL_RECOVERY = False
@@ -436,7 +436,7 @@ def trunks_tick(c, pbx_healthy):
     st = readjson(STATE / 'trunks.json', {})
     entries = st.setdefault('trunks', {})
     now = time.time()
-    gap = now - st.get('last_observed', now) > 300
+    gap = unexpected_check_gap(st.get('last_observed', now), now)
     report = trunk_report(c)
     st.update(last_observed=now, last_report=report)
     excluded = excluded_names('trunks')
@@ -680,7 +680,7 @@ def extensions_tick(c, pbx_healthy):
     for name in excluded:
         if name in groups:
             groups[name].update(failures=0, successes=0)
-    if now - st.get('last_observed', now) > 300:
+    if unexpected_check_gap(st.get('last_observed', now), now):
         st['collection_failures'] = 0
         st['collection_successes'] = 0
         for value in groups.values():
@@ -1428,6 +1428,12 @@ def snapshot(h):
     return dest
 
 
+def unexpected_check_gap(last, now):
+    # Node queues intentionally revisit PBXs less often than the local timer.
+    # Do not mistake a full fleet sweep for suspension and reset debounce forever.
+    return now - last > 300 and not (ETC / 'node-managed.json').exists()
+
+
 def tick(c):
     statepath = STATE / 'state.json'
     st = readjson(statepath, {})
@@ -1443,7 +1449,7 @@ def tick(c):
         reset_extension_debounce(c)
     # Long scheduling gaps can follow LXC suspension, backup or host overload.
     gap = now - st.get('last_observed', now)
-    if gap > 300:
+    if unexpected_check_gap(st.get('last_observed', now), now):
         st.update(failures=0, database_failures=0, fastagi_failures=0, core_fastagi_failures=0, settle_until=now + c['resume_grace'])
         reset_extension_debounce(c)
         reset_trunk_debounce(c)
@@ -1696,6 +1702,14 @@ def preflight():
         raise RuntimeError('Fix MariaDB/CLI/AMI health before enabling unattended recovery')
 
 
+def install_timer_schedule():
+    if (ETC / 'node-managed.json').exists():
+        checked(['systemctl', 'disable', '--now', 'freepbx-care.timer'])
+        print('Node-managed scheduling: local timer remains disabled; Proxmox starts the service.')
+    else:
+        checked(['systemctl', 'enable', '--now', 'freepbx-care.timer'])
+
+
 def install():
     require_supported_platform()
     for cmd in ['fwconsole', 'asterisk', 'php', 'systemctl', 'crontab', 'pgrep']:
@@ -1748,7 +1762,7 @@ Unit=freepbx-care.service
 WantedBy=timers.target
 ''', 0o644)
     checked(['systemctl', 'daemon-reload'])
-    checked(['systemctl', 'enable', '--now', 'freepbx-care.timer'])
+    install_timer_schedule()
     print('Installed. Rerun: bash /root/freepbx-care.sh')
 
 

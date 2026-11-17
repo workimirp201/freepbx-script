@@ -16,7 +16,7 @@ import urllib.request
 
 if sys.argv[0] == '-c': sys.argv = sys.argv[1:]
 URL = 'https://raw.githubusercontent.com/workimirp201/freepbx-script/refs/heads/main/freepbx-care.sh'
-EXPECTED_SHA256 = '5f04c6c140a7413467116a1d548c430099529767bc8e95e5beb31c2c3fbbb726'
+EXPECTED_SHA256 = '1e6a611bb7bd01387874c41b9fe0ff0edde46b33c6c7744167b06986dd262089'
 
 PAYLOAD = r'''
 import datetime, fcntl, hashlib, json, os, pathlib, shutil, subprocess, sys, tempfile
@@ -118,8 +118,11 @@ def update():
                 directory.mkdir(mode=0o700, parents=True, exist_ok=True)
                 os.chmod(directory, 0o700)
             namespace['install']()
-            subprocess.run(['systemctl', 'is-enabled', 'freepbx-care.timer'], check=True, timeout=15)
-            subprocess.run(['systemctl', 'is-active', 'freepbx-care.timer'], check=True, timeout=15)
+            if pathlib.Path('/etc/freepbx-care/node-managed.json').exists():
+                subprocess.run(['systemctl', 'disable', '--now', 'freepbx-care.timer'], check=True, timeout=15)
+            else:
+                subprocess.run(['systemctl', 'is-enabled', 'freepbx-care.timer'], check=True, timeout=15)
+                subprocess.run(['systemctl', 'is-active', 'freepbx-care.timer'], check=True, timeout=15)
         except Exception:
             print(f'Installation incomplete; inspect script/config/units and {backup}. No automatic installation rollback.')
             raise

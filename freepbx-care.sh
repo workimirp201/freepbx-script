@@ -33,8 +33,8 @@ ETC = Path('/etc/freepbx-care')
 STATE = Path('/var/lib/freepbx-care')
 LOG = Path('/var/log/freepbx-care')
 SELF = Path('/root/freepbx-care.sh')
-VERSION = '2026.11.17-local-care-r8.5'
-VOICEMAIL_SHA256 = '2fda81a87f2fc57115fb709aa3a31362c139b22fdc87254ae208c4096232665d'
+VERSION = '2026.11.17-local-care-r8.5.1'
+VOICEMAIL_SHA256 = '70edbd30b5dcc6d2340bb98b961ded5a7e5d79a5a74265dfd1a74d185d12db5f'
 # Deprecated CLI globals retained for compatibility with already deployed helpers.
 EXPERIMENTAL_DEBIAN13 = False
 EXPERIMENTAL_RECOVERY = False

@@ -489,15 +489,27 @@ def menu():
             print('Settings not completed. Check selection, recipient format, credentials or service state; no secrets displayed.')
 
 
+def prepare_directories(worker=False):
+    for path in [ETC,STATE]:
+        if path.is_symlink(): raise Problem('Refusing symlink private directory')
+        if worker:
+            # ProtectSystem=full deliberately makes /etc read-only. Setup has
+            # already created these directories; runtime must only validate.
+            s=path.lstat()
+            if not stat.S_ISDIR(s.st_mode) or s.st_uid!=0 or s.st_mode & 0o077:
+                raise Problem('Voicemail private directories must be root-owned mode 700; rerun setup')
+        else:
+            path.mkdir(mode=0o700,parents=True,exist_ok=True)
+            os.chmod(path,0o700)
+
+
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('command',nargs='?',default='menu',choices=['menu','work','status','install'])
     a=parser.parse_args()
     if os.geteuid()!=0: raise Problem('Run as root')
     os.umask(0o077)
-    for path in [ETC,STATE]:
-        if path.is_symlink(): raise Problem('Refusing symlink private directory')
-        path.mkdir(mode=0o700,parents=True,exist_ok=True); os.chmod(path,0o700)
+    prepare_directories(worker=a.command=='work')
     with (STATE/'lock').open('w') as lock:
         try: fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
         except BlockingIOError:

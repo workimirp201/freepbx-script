@@ -16,7 +16,7 @@ import urllib.request
 
 if sys.argv[0] == '-c': sys.argv = sys.argv[1:]
 URL = 'https://raw.githubusercontent.com/workimirp201/freepbx-script/refs/heads/main/freepbx-care.sh'
-EXPECTED_SHA256 = '5e53b7946c042d0175c63c187bfac6c274f4517d31fab1c1f35230e68d736188'
+EXPECTED_SHA256 = '8098cc4696413bcbdfc19046a1837d07634907511c6eb724d7037a066f70375b'
 
 PAYLOAD = r'''
 import datetime, hashlib, json, os, pathlib, shutil, subprocess, sys, tempfile

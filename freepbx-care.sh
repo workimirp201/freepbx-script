@@ -33,7 +33,8 @@ ETC = Path('/etc/freepbx-care')
 STATE = Path('/var/lib/freepbx-care')
 LOG = Path('/var/log/freepbx-care')
 SELF = Path('/root/freepbx-care.sh')
-VERSION = '2026.11.17-local-care-r8.4'
+VERSION = '2026.11.17-local-care-r8.5'
+VOICEMAIL_SHA256 = '2fda81a87f2fc57115fb709aa3a31362c139b22fdc87254ae208c4096232665d'
 # Deprecated CLI globals retained for compatibility with already deployed helpers.
 EXPERIMENTAL_DEBIAN13 = False
 EXPERIMENTAL_RECOVERY = False
@@ -1885,7 +1886,32 @@ def operation_lock():
         yield
 
 
+def voicemail_setup():
+    """Optional reviewed companion; keep slow network/interactive setup outside Care lock."""
+    import hashlib
+    import urllib.request
+    target = Path('/usr/local/lib/freepbx-care/voicemail.py')
+    if target.is_symlink(): raise RuntimeError('Refusing symlink voicemail companion')
+    raw = target.read_bytes() if target.is_file() else b''
+    if hashlib.sha256(raw).hexdigest() != VOICEMAIL_SHA256:
+        local = SELF.parent / 'freepbx-voicemail.py'
+        raw = local.read_bytes() if local.is_file() and not local.is_symlink() else b''
+        if hashlib.sha256(raw).hexdigest() != VOICEMAIL_SHA256:
+            url = 'https://raw.githubusercontent.com/workimirp201/freepbx-script/refs/heads/main/freepbx-voicemail.py'
+            with urllib.request.urlopen(url,timeout=30) as response: raw=response.read(262145)
+        if hashlib.sha256(raw).hexdigest() != VOICEMAIL_SHA256:
+            raise RuntimeError('Voicemail companion hash mismatch; publish matching Care/companion files')
+        compile(raw, 'freepbx-voicemail.py', 'exec')
+        target.parent.mkdir(mode=0o700,parents=True,exist_ok=True)
+        atomic(target,raw.decode('utf-8'),0o700)
+    result = subprocess.run(['python3',str(target),'menu'])
+    if result.returncode: raise RuntimeError('Voicemail setup did not complete; review its output')
+
+
 def menu_action(choice):
+    if choice == '19':
+        voicemail_setup()
+        return
     if choice == '13':
         module_review()  # Do not hold the watchdog lock while waiting for technician input.
         return
@@ -1913,7 +1939,7 @@ def menu_action(choice):
 
 def menu():
     while True:
-        print(f'\nFreePBX Care {VERSION}\n1 Configure Asterisk monitor\n2 Install/update monitoring\n3 Configure SMTP relay\n4 Read-only health/status\n5 Send test email\n6 Pause monitoring\n7 Resume monitoring\n8 Disable monitoring\n9 Collect diagnostics (no restart)\n10 Configure extension monitoring\n11 Read-only extension status\n12 Configure MariaDB / CRM / Core FastAGI\n13 Review/disable unused optional modules\n14 Investigate crash/resource issues\n15 Configure SIP trunk alerts\n16 Read-only SIP trunk status\n17 Property/trunk maintenance exclusion\n18 Unlock recovery after review\n0 Exit')
+        print(f'\nFreePBX Care {VERSION}\n1 Configure Asterisk monitor\n2 Install/update monitoring\n3 Configure SMTP relay\n4 Read-only health/status\n5 Send test email\n6 Pause monitoring\n7 Resume monitoring\n8 Disable monitoring\n9 Collect diagnostics (no restart)\n10 Configure extension monitoring\n11 Read-only extension status\n12 Configure MariaDB / CRM / Core FastAGI\n13 Review/disable unused optional modules\n14 Investigate crash/resource issues\n15 Configure SIP trunk alerts\n16 Read-only SIP trunk status\n17 Property/trunk maintenance exclusion\n18 Unlock recovery after review\n19 Voicemail transcription SMS / email\n0 Exit')
         choice = ask('Choose', '0')
         if choice == '0':
             return
@@ -1999,7 +2025,7 @@ def main():
     parser.add_argument('command', nargs='?', default='menu', choices=[
         'menu', 'configure', 'install', 'preflight', 'smtp', 'status', 'diagnose', 'check', 'test-mail',
         'pause', 'resume', 'backup-pause', 'backup-resume', 'disable', 'extensions', 'extensions-status', 'services',
-        'modules', 'module-audit', 'crash-audit', 'trunks', 'trunks-status', 'exclusions', 'recovery-unlock'])
+        'modules', 'module-audit', 'crash-audit', 'trunks', 'trunks-status', 'exclusions', 'recovery-unlock', 'voicemail'])
     parser.add_argument('--minutes', type=int, default=60)
     parser.add_argument('--smtp-config', help='root-owned mode-600 SMTP profile JSON')
     parser.add_argument('--experimental-debian13', action='store_true',
@@ -2024,6 +2050,9 @@ def main():
     if args.command == 'menu':
         require_supported_platform()
         menu()
+        return
+    if args.command == 'voicemail':
+        voicemail_setup()
         return
     if args.command == 'modules':
         module_review()

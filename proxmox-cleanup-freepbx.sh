@@ -133,6 +133,28 @@ def regular(path):
     return path.exists()
 
 
+def legacy_units(directory=Path('/etc/systemd/system')):
+    """Only retire simple units whose sole command is one of our old monitors."""
+    services=[];timers=[];unknown=[]
+    for path in directory.glob('*.service'):
+        if path.is_symlink() or not path.is_file():continue
+        text=path.read_text()
+        if not any(name in text for name in MONITORS):continue
+        commands=re.findall(r'(?m)^\s*Exec[A-Za-z]*\s*=.*$',text)
+        expected=any(re.fullmatch(r'\s*ExecStart\s*=\s*(?:(?:/bin/bash|/bin/sh)\s+)?'+re.escape(name)+r'\s*',commands[0]) for name in MONITORS) if len(commands)==1 else False
+        if expected and not (directory/(path.name+'.d')).exists():services.append(path)
+        else:unknown.append(str(path))
+    names={p.name for p in services}
+    for path in directory.glob('*.timer'):
+        if path.is_symlink() or not path.is_file():continue
+        text=path.read_text();target=re.findall(r'(?m)^\s*Unit\s*=\s*(\S+)\s*$',text)
+        inferred=path.with_suffix('.service').name
+        if (target and target[0] in names) or (not target and inferred in names):
+            if len(target)>1 or (directory/(path.name+'.d')).exists():unknown.append(str(path))
+            else:timers.append(path)
+    return services,timers,unknown
+
+
 def legacy_rewrites():
     """Only identify exact paths and the catch-all rules produced by the old installer."""
     rules = {}
@@ -393,6 +415,15 @@ def cleanup(apply=False, remove_rewrites=False, reset_smtp=False):
     cron = read_cron()
     kept, removed = split_cron(cron)
     archive = []
+    old_services,old_timers,unknown_units=legacy_units()
+    if unknown_units:raise RuntimeError('Unrecognized legacy service/override requires review: '+', '.join(unknown_units))
+    archive.extend(old_services+old_timers)
+    unit_states={}
+    for p in old_services+old_timers:
+        unit_states[p.name]=dict(enabled=run(['systemctl','show',p.name,'-p','UnitFileState','--value']).stdout.strip(),
+                                 active=run(['systemctl','show',p.name,'-p','ActiveState','--value']).stdout.strip())
+        if p in old_services and unit_states[p.name]['active'] not in ['inactive','failed']:
+            raise RuntimeError('Legacy service is still running; wait for completion before cleanup: '+p.name)
     for name in MONITORS:
         if regular(Path(name)):
             archive.append(Path(name))
@@ -455,10 +486,16 @@ def cleanup(apply=False, remove_rewrites=False, reset_smtp=False):
         archived=list(map(str, archive)), removed_cron=removed,
         detached_rules=rules if remove_rewrites else {}, smtp_reset=reset,
         disabled_care_timer=disable_care), indent=2))
+    (backup/'legacy-unit-states.json').write_text(json.dumps(unit_states,indent=2))
     moved = []
     cron_written = False
     original_main = Path('/etc/postfix/main.cf')
     try:
+        for p in old_timers:run(['systemctl','disable','--now',p.name])
+        for p in old_services:
+            if run(['systemctl','show',p.name,'-p','ActiveState','--value']).stdout.strip() not in ['inactive','failed']:
+                raise RuntimeError('Legacy service started during cleanup; retry after completion')
+            run(['systemctl','disable',p.name])
         if disable_care:
             run(['systemctl', 'disable', '--now', 'freepbx-care.timer'])
         if read_cron() != cron:
@@ -483,11 +520,18 @@ def cleanup(apply=False, remove_rewrites=False, reset_smtp=False):
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.move(str(p), str(target))
             moved.append((p, target))
+        if unit_states:run(['systemctl','daemon-reload'])
     except Exception:
         for p, target in reversed(moved):
             shutil.move(str(target), str(p))
         if cron_written:
             run(['crontab', '-'], cron, ok=False)
+        if unit_states:
+            run(['systemctl','daemon-reload'],ok=False)
+            for unit,old in unit_states.items():
+                if old['enabled'] in ['enabled','enabled-runtime']:
+                    run(['systemctl','enable']+(['--runtime'] if old['enabled']=='enabled-runtime' else [])+[unit],ok=False)
+                if unit.endswith('.timer') and old['active']=='active':run(['systemctl','start',unit],ok=False)
         saved_main = backup / 'etc/postfix/main.cf'
         if (remove_rewrites or reset) and saved_main.exists():
             shutil.copy2(saved_main, original_main)
@@ -531,6 +575,7 @@ if __name__ == '__main__':
         sys.exit(1)
 PYTHON
 )" "$0" "$@"
+
 FREEPBX_CLEANUP_PAYLOAD
   then
     processed=$((processed + 1))

@@ -8,6 +8,7 @@ import copy
 from contextlib import contextmanager
 import datetime
 import email.message
+import email.utils
 import fcntl
 import getpass
 import json
@@ -33,13 +34,15 @@ ETC = Path('/etc/freepbx-care')
 STATE = Path('/var/lib/freepbx-care')
 LOG = Path('/var/log/freepbx-care')
 SELF = Path('/root/freepbx-care.sh')
-VERSION = '2026.11.17-local-care-r8.5.1'
-VOICEMAIL_SHA256 = '70edbd30b5dcc6d2340bb98b961ded5a7e5d79a5a74265dfd1a74d185d12db5f'
+VERSION = '2026.11.17-local-care-r9'
+VOICEMAIL_SHA256 = 'f0316a610b52c845178dbeec0524b4fc22997dd81132666d6788e89b2663890b'
+VOICEMAIL_AMI_SHA256 = '8acacb15c8eac45869d251325203d1cc190d82e5faaa09d0e7ff3125fea10edf'
 # Deprecated CLI globals retained for compatibility with already deployed helpers.
 EXPERIMENTAL_DEBIAN13 = False
 EXPERIMENTAL_RECOVERY = False
 KNOWN_SECRETS = set()
-DEFAULT = dict(email='monitor@famecomputers.com', sender='', auto_restart=True,
+DEFAULT = dict(email='monitor@famecomputers.com', sender='', reply_to='', auto_restart=True,
+               recovery_priority='availability', repair_native_ami=True,
                failures=3, cooldown=1800, max_restarts_hour=2, boot_grace=300,
                resume_grace=180, defer_active_calls=True, ami={},
                extension_monitor=dict(enabled=False, failures=3, groups=[]),
@@ -70,36 +73,28 @@ MODULE_LABELS = {
 
 
 def run(args, timeout=15, data=None, kill_group=True):
-    """No shell. Recovery preserves daemons that fwconsole may have started."""
-    p = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                         stderr=subprocess.PIPE, text=True, start_new_session=True)
-    try:
-        out, err = p.communicate(data, timeout=timeout)
-        return p.returncode, out, err
-    except subprocess.TimeoutExpired as expired:
-        if not kill_group:
-            # Do not kill a newly launched Asterisk/PM2 daemon with its parent.
-            # Avoid communicate(): descendants may still hold the pipe open.
-            p.terminate()
-            try:
-                p.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                p.kill()
-                p.wait(timeout=3)
-            out = expired.output or ''
-            err = expired.stderr or ''
-            if isinstance(out, bytes): out = out.decode(errors='replace')
-            if isinstance(err, bytes): err = err.decode(errors='replace')
-            p.stdout.close()
-            p.stderr.close()
-            return 124, out, err + '\ncommand timed out; recovery requires operator review'
-        os.killpg(p.pid, signal.SIGTERM)
-        try:
-            out, err = p.communicate(timeout=3)
-        except subprocess.TimeoutExpired:
-            os.killpg(p.pid, signal.SIGKILL)
-            out, err = p.communicate()
-        return 124, out, err + '\ncommand timed out'
+    """Finite waits/capture; recovery never kills the daemons it launched."""
+    with tempfile.TemporaryFile() as inp, tempfile.TemporaryFile() as out, tempfile.TemporaryFile() as err:
+        if data is not None: inp.write(data.encode() if isinstance(data,str) else data)
+        inp.seek(0)
+        p=subprocess.Popen(args,stdin=inp,stdout=out,stderr=err,start_new_session=True)
+        deadline=time.monotonic()+timeout;limited=False
+        while p.poll() is None:
+            if time.monotonic()>=deadline or os.fstat(out.fileno()).st_size+os.fstat(err.fileno()).st_size>2*1024*1024:
+                limited=True
+                for sig in [signal.SIGTERM,signal.SIGKILL]:
+                    try:
+                        if kill_group: os.killpg(p.pid,sig)
+                        else:p.send_signal(sig)
+                    except ProcessLookupError:break
+                    try:p.wait(timeout=2);break
+                    except subprocess.TimeoutExpired:pass
+                break
+            time.sleep(.05)
+        out.seek(0);err.seek(0)
+        stdout=out.read(1024*1024).decode(errors='replace');stderr=err.read(1024*1024).decode(errors='replace')
+        if limited:return 124,stdout,stderr+'\ncommand deadline/output limit reached; completion requires review'
+        return p.returncode,stdout,stderr
 
 
 def checked(args, timeout=60):
@@ -158,12 +153,15 @@ def address(s):
 def validate(c):
     if not address(c['email']) or (c['sender'] and not address(c['sender'])):
         raise ValueError('Invalid notification email or sender')
+    if c.get('reply_to') and not address(c['reply_to']): raise ValueError('Invalid Reply-To')
+    if c.get('recovery_priority') not in ['availability','protect_calls']:
+        raise ValueError('Recovery priority must be availability or protect_calls')
     for key, low, high in [('failures', 2, 60), ('cooldown', 300, 86400),
                            ('max_restarts_hour', 1, 6), ('boot_grace', 60, 3600),
                            ('resume_grace', 60, 900)]:
         if type(c[key]) is not int or not low <= c[key] <= high:
             raise ValueError(f'Invalid {key}: expected {low}..{high}')
-    for key in ['auto_restart', 'defer_active_calls', 'auto_start_mariadb', 'monitor_fastagi', 'recover_core_fastagi']:
+    for key in ['auto_restart', 'defer_active_calls', 'auto_start_mariadb', 'monitor_fastagi', 'recover_core_fastagi','repair_native_ami']:
         if type(c[key]) is not bool:
             raise ValueError(f'{key} must be boolean')
     validate_extensions(c['extension_monitor'])
@@ -240,12 +238,15 @@ def recovery_notices(c, st):
                                     ('last_database_start_result', 'MariaDB start', 'database'),
                                     ('last_core_fastagi_result', 'Core FastAGI recovery', 'health')]:
         result = st.get(key)
+        if result and result.get('time',0)<=st.get('last_recovery_review',{}).get('time',0):
+            continue
         if key == 'last_core_fastagi_result' and result and result.get('command') != ['fwconsole', 'start', '--post', 'core']:
             continue  # Historical r8.2 fallback is not a verified Core service restoration.
         if result:
             outcome = 'verified' if result['exit'] == 0 and result[health_key]['healthy'] else 'failed'
             token = str(result['time']) + ' ' + outcome
-            transition(c, st, label, token, json.dumps(result, indent=2))
+            local_time=datetime.datetime.fromtimestamp(result['time'],datetime.timezone.utc).astimezone().isoformat()
+            transition(c, st, label, token, 'Recovery observed: '+local_time+'\n'+json.dumps(result, indent=2))
 
 
 def idle_channels():
@@ -326,6 +327,12 @@ def recovery_unlock():
                 'core_fastagi_recovery_inflight', 'core_fastagi_block_reason']:
         st.pop(key, None)
     # Attempt timestamps remain intact: unlock cannot bypass cooldown/hourly limits.
+    st['observed_asterisk_restarts']=[]
+    st['last_recovery_review']=dict(time=time.time(),reviewed=reviewed)
+    for key in ['Asterisk recovery','Core FastAGI recovery','MariaDB recovery']:
+        st.setdefault('notified',{}).pop(key,None)
+    for key in ['Asterisk recovery lock','MariaDB recovery lock']:
+        transition(c,st,key,'healthy','Recovery evidence reviewed and current health verified; automatic recovery unlocked.')
     save(STATE / 'state.json', st)
     diagnostic_write(LOG / 'last-recovery-unlock.log', json.dumps(dict(
         time=time.time(), user=os.environ.get('SUDO_USER') or os.environ.get('USER', 'root'), reviewed=reviewed)))
@@ -546,7 +553,11 @@ def notify(c, subject, body):
     msg = email.message.EmailMessage()
     msg['To'] = c['email']
     msg['From'] = c['sender'] or ('root@' + socket.getfqdn())
-    msg['Subject'] = f'FreePBX {socket.gethostname()}: {redact(subject)}'
+    subject = re.sub(r': \d+(?:\.\d+)? (failed|verified)$', r': \1', subject)
+    msg['Subject'] = f'[Care][{socket.gethostname()}] {redact(subject)}'
+    msg['Date'] = email.utils.formatdate(localtime=True)
+    msg['Message-ID'] = email.utils.make_msgid(domain=str(msg['From']).rsplit('@',1)[-1])
+    if c.get('reply_to'): msg['Reply-To']=c['reply_to']
     msg.set_content(redact(body))
     try:
         rc, _, _ = run(['/usr/sbin/sendmail', '-oi', '-f', str(msg['From']), '--', c['email']],
@@ -914,7 +925,7 @@ def health(c):
     return dict(cli=cli_ok, ami=ami, database=database, shutting_down=shutting_down,
                 asterisk_uptime=int(uptime[1]) if uptime else None,
                 healthy=database['healthy'] and cli_ok and ami == 'healthy',
-                restartable=database['healthy'] and not shutting_down and (not cli_ok or ami == 'unreachable'))
+                restartable=database['healthy'] and not shutting_down and ami not in ['auth_error','config_error','protocol_error'] and (not cli_ok or ami == 'unreachable'))
 
 
 def database_tick(c, st, h, statepath):
@@ -1106,6 +1117,7 @@ def core_fastagi_tick(c, st, pbx_healthy):
     st['settle_until'] = time.time() + c['resume_grace']
     if after['healthy']:
         st['core_fastagi_failures'] = 0
+        st['last_core_fastagi']=dict(enabled=after.get('fastagi_enabled'),listening=after.get('listening'),services=after.get('services'),time=time.time())
         transition(c, st, 'Core FastAGI', 'healthy', 'Core services restored; FastAGI mode remains enabled. Confirm real calls.')
     save(statepath, st)
     recovery_notices(c, st)
@@ -1359,7 +1371,7 @@ def crash_audit():
     print('Crash review: memory/OOM and swap pressure; disk space AND inodes; CPU quotas/I/O stalls;')
     print('failed services, overlapping legacy jobs, backups, module/OS updates, and SIP/security incidents.')
     print('High usage, historical OOM counters, or an installed module alone do not prove the cause.')
-    print('Read-only evidence; no services/modules restarted/disabled and no files purged.')
+    print('Diagnostic commands do not change services/modules. Incident files are written; the newest 20 are retained.')
     print('Diagnostics saved:', snapshot(health(config())))
 
 
@@ -1406,7 +1418,6 @@ def snapshot(h):
                 ['ss', '-lntp'],
                 ['journalctl', '-u', 'mariadb', '-b', '-1', '-n', '80', '--no-pager'],
                 ['journalctl', '-u', 'mariadb', '--since', '7 days ago', '-n', '100', '--no-pager'],
-                ['fwconsole', 'pm2', '--list'],
                 ['journalctl', '-u', 'incron', '-u', 'mariadb', '-u', 'freepbx',
                  '-u', 'apache2', '-n', '100', '--no-pager'],
                 ['tail', '-n', '150', '/var/log/asterisk/full'],
@@ -1435,10 +1446,50 @@ def unexpected_check_gap(last, now):
     return now - last > 300 and not (ETC / 'node-managed.json').exists()
 
 
+def monitoring_enabled():
+    return readjson(ETC/'monitoring.json', {'enabled':True}).get('enabled',True) is True
+
+
+def set_monitoring(enabled):
+    save(ETC/'monitoring.json',dict(enabled=enabled,changed=time.time()))
+    if not enabled: checked(['systemctl','disable','--now','freepbx-care.timer'])
+    print('Monitoring enabled for node dispatch.' if enabled else 'Monitoring disabled; node dispatch will skip this PBX.')
+
+
+def record_check(st,status,reason='',health_result=None):
+    result=dict(status=status,reason=reason,observed_at=time.time())
+    if health_result is not None: result.update(checked_at=time.time(),health=health_result)
+    st['last_check_result']=result
+    save(STATE/'state.json',st)
+
+
+def repair_ami(c,st,h):
+    if not c.get('repair_native_ami') or not c['auto_restart'] or h['ami'] not in ['auth_error','config_error','protocol_error']:
+        return h
+    now=time.time()
+    if now-st.get('last_ami_repair',0)<c['cooldown']: return h
+    st['last_ami_repair']=now;save(STATE/'state.json',st)
+    native=dict(c,ami={})
+    if ami_probe(native)!='healthy' and h['cli']:
+        # Re-read existing native manager config; never change credentials/ACLs.
+        cli('manager reload')
+    if ami_probe(native)=='healthy':
+        if c['ami']:
+            save(ETC/('ami-before-repair-'+str(int(now))+'.json'),c['ami'])
+            c['ami']={};save(ETC/'config.json',c)
+        transition(c,st,'AMI configuration','healthy','Native AMI restored/validated; no Asterisk restart.')
+        return health(c)
+    transition(c,st,'AMI configuration','outage','Native AMI still fails. Review manager account/ACL/config; restart cannot repair credentials.')
+    return h
+
+
 def tick(c):
     statepath = STATE / 'state.json'
     st = readjson(statepath, {})
     now = time.time()
+    if not monitoring_enabled():
+        record_check(st,'disabled','Persistent monitoring flag is off')
+        return
     for prefix in ['', 'database_', 'core_fastagi_']:
         if st.get(prefix + 'recovery_inflight'):
             st[prefix + 'recovery_blocked'] = True
@@ -1467,9 +1518,13 @@ def tick(c):
         st.update(database_failures=0, fastagi_failures=0, core_fastagi_failures=0)
         reset_extension_debounce(c)
         save(statepath, st)
-        log('Monitoring skipped: pause, boot/resume grace, fwconsole operation, or pending module review')
+        reason=('maintenance/backup pause' if paused else 'boot grace' if uptime<c['boot_grace'] else
+                'settling grace' if st.get('settle_until',0)>now else 'fwconsole busy' if fwconsole_busy() else 'pending module review')
+        record_check(st,'deferred',reason)
+        log('Monitoring deferred: '+reason)
         return
     h = health(c)
+    h = repair_ami(c,st,h)
     recovery_notices(c, st)
     observe_asterisk_restarts(c, st, h, now)
     if not h['database']['healthy']:
@@ -1487,6 +1542,7 @@ def tick(c):
         reset_trunk_debounce(c)
         save(statepath, st)
         log('Asterisk/extension/CRM recovery checks deferred: database dependency unavailable')
+        record_check(st,'unhealthy','Database dependency unavailable',h)
         return
     if h['healthy']:
         st['failures'] = 0
@@ -1503,7 +1559,11 @@ def tick(c):
             allowed = (c['auto_restart'] and h['restartable'] and not st.get('recovery_blocked') and
                        now - st.get('last_restart', 0) >= c['cooldown'] and
                        len(history) < c['max_restarts_hour'])
-            if allowed and c['defer_active_calls'] and h['cli']:
+            protect_calls=c.get('recovery_priority')=='protect_calls' and c['defer_active_calls']
+            if allowed and protect_calls and not h['cli']:
+                # Absent process may start; an existing process has unknown calls.
+                allowed = recovery_command(h)==['fwconsole','start']
+            if allowed and protect_calls and h['cli']:
                 rc, out, _ = cli('core show channels count')
                 m = re.search(r'(?m)^\s*(\d+) active channels?\b', out)
                 if rc or not m or int(m[1]) > 0:
@@ -1513,7 +1573,7 @@ def tick(c):
                 command = recovery_command(h)
                 if command is None:
                     log('Recovery deferred: cannot determine Asterisk process state')
-                    save(statepath, st)
+                    record_check(st,'deferred','Cannot determine Asterisk process state',h)
                     return
                 # Capture evidence and persist the attempt BEFORE starting fwconsole.
                 evidence = snapshot(h)
@@ -1521,11 +1581,11 @@ def tick(c):
                 current = health(c)
                 if fwconsole_busy() or not current['restartable'] or recovery_command(current) != command:
                     log('Recovery deferred: health/process state changed during diagnostics')
-                    save(statepath, st)
+                    record_check(st,'deferred','Health/process state changed during diagnostics',current)
                     return
-                if c['defer_active_calls'] and current['cli'] and not idle_channels():
+                if protect_calls and (not current['cli'] and command!=['fwconsole','start'] or current['cli'] and not idle_channels()):
                     log('Recovery deferred: new calls or unknown channel count after diagnostics')
-                    save(statepath, st)
+                    record_check(st,'deferred','Protect-calls policy: new/unknown calls',current)
                     return
                 st.update(last_restart=now, restarts=history + [now], failures=0, recovery_inflight=True)
                 save(statepath, st)
@@ -1564,6 +1624,17 @@ def tick(c):
         trunks_tick(c, h['healthy'])
     except (RuntimeError, ValueError, OSError) as e:
         log(f'Trunk monitoring failed: {e}; core PBX check completed')
+    summary=dict(h)
+    if c.get('recover_core_fastagi'):
+        core=st.get('last_core_fastagi',{})
+        summary['core_fastagi']=core
+        summary['fully_functional']=h['healthy'] and (core.get('enabled') is False or
+            core.get('enabled') is True and core.get('listening') is True and all((core.get('services') or {}).get(k) for k in ['pm2_enabled','core-fastagi','core-calltransfer-monitor']))
+    else: summary['fully_functional']=h['healthy']
+    if c.get('monitor_fastagi'):
+        summary['crm_fastagi']=fastagi_health()
+        summary['fully_functional']=summary['fully_functional'] and summary['crm_fastagi']
+    record_check(st,'healthy' if summary['fully_functional'] else 'unhealthy',health_result=summary)
 
 
 def ask(label, default='', secret=False):
@@ -1573,17 +1644,28 @@ def ask(label, default='', secret=False):
     return (value if secret else value.strip()) or default
 
 
+def yesno(label,default=False):
+    while True:
+        value=ask(label,'y' if default else 'n').lower()
+        if value in ['yes','y']:return True
+        if value in ['no','n']:return False
+        print('Enter y or n.')
+
+
 def configure():
     c = config()
     c['email'] = ask('Alert recipient', c['email'])
     c['sender'] = ask('Sender email (blank keeps system default)', c['sender'])
-    c['auto_restart'] = ask('Enable automatic recovery? y/n', 'y' if c['auto_restart'] else 'n').lower() == 'y'
-    c['defer_active_calls'] = ask('Defer restart while CLI reports active channels? y/n',
-                                  'y' if c['defer_active_calls'] else 'n').lower() == 'y'
+    c['reply_to']=ask('Reply-To email (optional)',c.get('reply_to',''))
+    c['recovery_priority']=ask('Recovery priority: availability or protect_calls',c.get('recovery_priority','availability'))
+    c['auto_restart'] = yesno('Enable automatic recovery? y/n',c['auto_restart'])
+    c['defer_active_calls'] = yesno('Protect-calls policy: defer on active/unknown calls? y/n',c['defer_active_calls'])
     for key, label in [('failures', 'Consecutive failed checks'), ('cooldown', 'Restart cooldown seconds'),
                        ('max_restarts_hour', 'Maximum restart attempts per hour')]:
         c[key] = int(ask(label, str(c[key])))
-    if ask('AMI settings: auto or manual?', 'auto' if not c['ami'] else 'manual') == 'manual':
+    mode=ask('AMI settings: auto or manual?', 'auto' if not c['ami'] else 'manual')
+    if mode not in ['auto','manual']:raise ValueError('Choose auto or manual')
+    if mode == 'manual':
         a = c['ami']
         c['ami'] = dict(host=ask('Local AMI host', a.get('host', '127.0.0.1')),
                         port=int(ask('AMI port', str(a.get('port', 5038)))),
@@ -1704,7 +1786,7 @@ def preflight():
 
 
 def install_timer_schedule():
-    if (ETC / 'node-managed.json').exists():
+    if (ETC / 'node-managed.json').exists() or not monitoring_enabled():
         checked(['systemctl', 'disable', '--now', 'freepbx-care.timer'])
         print('Node-managed scheduling: local timer remains disabled; Proxmox starts the service.')
     else:
@@ -1904,6 +1986,17 @@ def voicemail_setup():
         compile(raw, 'freepbx-voicemail.py', 'exec')
         target.parent.mkdir(mode=0o700,parents=True,exist_ok=True)
         atomic(target,raw.decode('utf-8'),0o700)
+    listener=target.parent/'voicemail_ami.py'
+    if listener.is_symlink():raise RuntimeError('Refusing symlink AMI listener')
+    raw=listener.read_bytes() if listener.is_file() else b''
+    if hashlib.sha256(raw).hexdigest()!=VOICEMAIL_AMI_SHA256:
+        local=SELF.parent/'freepbx-voicemail-ami.py'
+        raw=local.read_bytes() if local.is_file() and not local.is_symlink() else b''
+        if hashlib.sha256(raw).hexdigest()!=VOICEMAIL_AMI_SHA256:
+            url='https://raw.githubusercontent.com/workimirp201/freepbx-script/refs/heads/main/freepbx-voicemail-ami.py'
+            with urllib.request.urlopen(url,timeout=30) as response:raw=response.read(262145)
+        if hashlib.sha256(raw).hexdigest()!=VOICEMAIL_AMI_SHA256:raise RuntimeError('AMI listener component hash mismatch')
+        compile(raw,'freepbx-voicemail-ami.py','exec');atomic(listener,raw.decode('utf-8'),0o700)
     result = subprocess.run(['python3',str(target),'menu'])
     if result.returncode: raise RuntimeError('Voicemail setup did not complete; review its output')
 
@@ -1915,6 +2008,9 @@ def menu_action(choice):
     if choice == '13':
         module_review()  # Do not hold the watchdog lock while waiting for technician input.
         return
+    if choice=='4':status();return
+    if choice=='11':print(json.dumps(extension_report(config()),indent=2));return
+    if choice=='16':print(json.dumps(trunk_report(config()),indent=2));return
     with operation_lock():
         if choice == '1': configure()
         elif choice == '2': install()
@@ -1923,7 +2019,7 @@ def menu_action(choice):
         elif choice == '5': testmail()
         elif choice == '6': pause(int(ask('Pause minutes', '60')))
         elif choice == '7': resume()
-        elif choice == '8': checked(['systemctl', 'disable', '--now', 'freepbx-care.timer'])
+        elif choice == '8': set_monitoring(False)
         elif choice == '9': print('Diagnostics saved:', snapshot(health(config())))
         elif choice == '10': configure_extensions()
         elif choice == '11': print('Extension status (no email/restart):', json.dumps(extension_report(config()), indent=2))
@@ -1951,6 +2047,7 @@ def menu():
 
 def status():
     print('Version:', VERSION)
+    print('Monitoring enabled:',monitoring_enabled())
     info = require_supported_platform()
     print('Platform:', info.get('PRETTY_NAME', 'Debian ' + info['VERSION_ID']))
     print('Platform policy: standard Care safeguards (Debian 12 / Debian 13)')
@@ -1970,7 +2067,8 @@ def status():
     print('Saved state:', json.dumps(readjson(STATE / 'state.json', {}), indent=2))
     print('Maintenance:', json.dumps(readjson(STATE / 'pause.json', {})))
     print('Backup pause:', json.dumps(readjson(STATE / 'backup-pause.json', {})))
-    print('Pending module-change hold:', json.dumps(readjson(STATE / 'module-change-pending.json', {})))
+    marker=STATE/'module-change-pending.json'
+    print('Pending module-change hold:',json.dumps(dict(exists=marker.exists(),details=readjson(marker,{}))))
     print('Extension settings:', json.dumps(config()['extension_monitor'], indent=2))
     print('Saved extension state:', json.dumps(readjson(STATE / 'extensions.json', {}), indent=2))
     c = config()
@@ -2011,6 +2109,7 @@ def resume():
             raise RuntimeError('Module-change hold retained: finish fwconsole work and restore MariaDB/CLI/AMI health first')
         pending.unlink()
     save(STATE / 'pause.json', dict(until=0))
+    set_monitoring(True)
     st = readjson(STATE / 'state.json', {})
     st.update(failures=0, database_failures=0, fastagi_failures=0, core_fastagi_failures=0,
               settle_until=time.time() + config()['resume_grace'])
@@ -2044,6 +2143,14 @@ def main():
     if os.geteuid() != 0:
         parser.error('Run as root: sudo bash freepbx-care.sh')
     os.umask(0o077)
+    readonly={'status','extensions-status','trunks-status','module-audit','preflight'}
+    if args.command in readonly:
+        if args.command=='status':status()
+        elif args.command=='extensions-status':print(json.dumps(extension_report(config()),indent=2))
+        elif args.command=='trunks-status':print(json.dumps(trunk_report(config()),indent=2))
+        elif args.command=='module-audit':show_module_audit()
+        else:preflight()
+        return
     for p in [ETC, STATE, LOG]:
         p.mkdir(mode=0o700, parents=True, exist_ok=True)
         os.chmod(p, 0o700)
@@ -2083,7 +2190,7 @@ def main():
         elif args.command == 'resume': resume()
         elif args.command == 'backup-pause': backup_pause(args.minutes)
         elif args.command == 'backup-resume': backup_pause(3)
-        elif args.command == 'disable': checked(['systemctl', 'disable', '--now', 'freepbx-care.timer'])
+        elif args.command == 'disable': set_monitoring(False)
 
 
 if __name__ == '__main__':
